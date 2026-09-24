@@ -9824,6 +9824,446 @@ fn snowflake_lateral_flatten_tracks_source_table() {
     );
 }
 
+/// Table columns an output column is computed from, as `relation.column`,
+/// lowercased, following derivation and data-flow edges through CTEs,
+/// derived tables and table functions.
+fn base_sources_of(stmt: &StmtView<'_>, output: &str) -> HashSet<String> {
+    let owner_of = |id: &str| {
+        stmt.edges
+            .iter()
+            .find(|edge| edge.edge_type == EdgeType::Ownership && &*edge.to == id)
+            .and_then(|edge| stmt.nodes.iter().copied().find(|node| node.id == edge.from))
+    };
+    let target = stmt
+        .nodes
+        .iter()
+        .find(|node| {
+            node.node_type == NodeType::Column
+                && node.label.eq_ignore_ascii_case(output)
+                && owner_of(&node.id).is_some_and(|owner| owner.node_type == NodeType::Output)
+        })
+        .unwrap_or_else(|| panic!("output column {output} should exist"));
+
+    let mut sources = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![target.id.clone()];
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for edge in stmt.edges.iter().filter(|edge| {
+            edge.to == id && matches!(edge.edge_type, EdgeType::Derivation | EdgeType::DataFlow)
+        }) {
+            let Some(source) = stmt
+                .nodes
+                .iter()
+                .find(|node| node.id == edge.from && node.node_type == NodeType::Column)
+            else {
+                continue;
+            };
+            match owner_of(&source.id) {
+                Some(owner) if owner.node_type == NodeType::Table => {
+                    sources.insert(format!("{}.{}", owner.label, source.label).to_lowercase());
+                }
+                _ => pending.push(source.id.clone()),
+            }
+        }
+    }
+    sources
+}
+
+/// Edges that carry data into the columns of the relation labelled `alias`,
+/// keyed by the lowercased column label.
+fn flows_into_columns_of<'a>(stmt: &StmtView<'a>, alias: &str) -> Vec<(String, &'a Edge)> {
+    let relation = find_cte_node(stmt, alias).unwrap_or_else(|| panic!("{alias} should exist"));
+    stmt.edges
+        .iter()
+        .filter(|owned| owned.edge_type == EdgeType::Ownership && owned.from == relation.id)
+        .flat_map(|owned| {
+            let label = stmt
+                .nodes
+                .iter()
+                .find(|node| node.id == owned.to)
+                .map(|node| node.label.to_lowercase())
+                .unwrap_or_default();
+            stmt.edges
+                .iter()
+                .copied()
+                .filter(move |edge| {
+                    edge.to == owned.to
+                        && matches!(edge.edge_type, EdgeType::Derivation | EdgeType::DataFlow)
+                })
+                .map(move |edge| (label.clone(), edge))
+        })
+        .collect()
+}
+
+fn schema_of(tables: Vec<SchemaTable>) -> SchemaMetadata {
+    SchemaMetadata {
+        allow_implied: false,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables,
+    }
+}
+
+#[test]
+fn flatten_value_comes_from_its_input_not_from_a_namesake() {
+    // `value` is also a column of orders: `f.value` must not resolve to it.
+    let sql = r#"
+        SELECT o.order_id, f.value::STRING AS tag
+        FROM orders o,
+        LATERAL FLATTEN(input => o.tags) f
+    "#;
+    let schema = schema_of(vec![schema_table(
+        None,
+        None,
+        "orders",
+        &["order_id", "tags", "value"],
+    )]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "tag"),
+        expected_sources(&["orders.tags"])
+    );
+
+    let flows = flows_into_columns_of(&stmt, "f");
+    let expressions: HashSet<(&str, Option<&str>)> = flows
+        .iter()
+        .map(|(column, edge)| (column.as_str(), edge.expression.as_deref()))
+        .collect();
+    assert_eq!(
+        expressions,
+        HashSet::from([
+            ("value", Some("FLATTEN(input => o.tags)")),
+            ("this", Some("FLATTEN(input => o.tags)")),
+        ])
+    );
+}
+
+#[test]
+fn flatten_alias_is_not_an_implied_table() {
+    // Without a schema the tables are implied from what the query reads:
+    // orders has the flattened tags, and `f` is no table at all.
+    let sql = r#"
+        SELECT o.order_id, f.value::STRING AS tag, f.key AS k
+        FROM orders o,
+        LATERAL FLATTEN(input => o.tags) f
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let resolved = result
+        .resolved_schema
+        .expect("resolved schema should be present");
+    let tables: Vec<(String, Vec<String>)> = resolved
+        .tables
+        .iter()
+        .map(|table| {
+            (
+                table.name.to_lowercase(),
+                table.columns.iter().map(|col| col.name.clone()).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tables,
+        vec![(
+            "orders".to_string(),
+            vec!["order_id".to_string(), "tags".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn chained_flattens_reach_the_first_input() {
+    let sql = r#"
+        SELECT m.value::STRING AS month
+        FROM events e,
+        LATERAL FLATTEN(input => PARSE_JSON(e.payload)) a,
+        LATERAL FLATTEN(input => SPLIT(a.value:"1"::STRING, ',')) m
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "month"),
+        expected_sources(&["events.payload"])
+    );
+}
+
+#[test]
+fn flatten_position_columns_read_nothing() {
+    // `f.index` numbers the elements of the array: it is not a value of
+    // orders, and the join to audit feeds nothing.
+    let sql = r#"
+        WITH base AS (
+            SELECT o.id, o.a, o.b
+            FROM orders o
+            JOIN audit k ON o.id = k.id
+        ),
+        opts AS (
+            SELECT 'n' || (f.index + 1) AS n, b.*
+            FROM base b,
+            LATERAL FLATTEN(input => ARRAY_CONSTRUCT(b.a, b.b)) f
+        )
+        SELECT CONCAT_WS('/', id, n) AS label
+        FROM opts
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "orders", &["id", "a", "b"]),
+        schema_table(None, None, "audit", &["id", "note"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "label"),
+        expected_sources(&["orders.id"])
+    );
+
+    let fed: HashSet<String> = flows_into_columns_of(&stmt, "f")
+        .into_iter()
+        .map(|(column, _)| column)
+        .collect();
+    assert_eq!(fed, expected_sources(&["value", "this"]));
+}
+
+#[test]
+fn flatten_of_a_literal_reads_nothing() {
+    let sql = r#"
+        SELECT o.id, f.value AS step
+        FROM orders o,
+        LATERAL FLATTEN(input => ARRAY_CONSTRUCT(1, 2, 3)) f
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    assert!(flows_into_columns_of(&stmt, "f").is_empty());
+    assert!(base_sources_of(&stmt, "step").is_empty());
+}
+
+#[test]
+fn flatten_alias_reused_across_ctes_keeps_each_input() {
+    // Each CTE flattens its own column under the same alias. The second one
+    // passes the input positionally.
+    let sql = r#"
+        WITH order_tags AS (
+            SELECT f.value::STRING AS tag
+            FROM orders o,
+            LATERAL FLATTEN(input => o.tags) f
+        ),
+        ticket_notes AS (
+            SELECT f.value::STRING AS note
+            FROM tickets t,
+            LATERAL FLATTEN(t.notes) f
+        )
+        SELECT tag, note
+        FROM order_tags, ticket_notes
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "tag"),
+        expected_sources(&["orders.tags"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "note"),
+        expected_sources(&["tickets.notes"])
+    );
+}
+
+#[test]
+fn star_over_flatten_returns_its_columns() {
+    let sql = r#"
+        SELECT *
+        FROM items i,
+        LATERAL FLATTEN(input => i.arr) f
+    "#;
+    let schema = schema_of(vec![schema_table(None, None, "items", &["id", "arr"])]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    let output = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("output node");
+    let columns: HashSet<String> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::Ownership && edge.from == output.id)
+        .filter_map(|edge| stmt.nodes.iter().find(|node| node.id == edge.to))
+        .map(|node| node.label.to_lowercase())
+        .collect();
+    assert_eq!(
+        columns,
+        expected_sources(&["id", "arr", "seq", "key", "path", "index", "value", "this"])
+    );
+    for carried in ["value", "this"] {
+        assert_eq!(
+            base_sources_of(&stmt, carried),
+            expected_sources(&["items.arr"]),
+            "sources of {carried}"
+        );
+    }
+    for position in ["seq", "key", "path", "index"] {
+        assert!(
+            base_sources_of(&stmt, position).is_empty(),
+            "{position} should read nothing"
+        );
+    }
+}
+
+#[test]
+fn bare_column_beside_flatten_belongs_to_the_table() {
+    // No schema: `id` and `status` are not columns of FLATTEN, so they can
+    // only be columns of orders.
+    let sql = r#"
+        SELECT id, f.value AS v
+        FROM orders o,
+        LATERAL FLATTEN(input => o.tags) f
+        WHERE status = 'open'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "id"),
+        expected_sources(&["orders.id"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "v"),
+        expected_sources(&["orders.tags"])
+    );
+    let orders = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Table)
+        .expect("orders node");
+    assert!(
+        orders
+            .filters
+            .iter()
+            .any(|filter| filter.expression.contains("status")),
+        "{:?}",
+        orders.filters
+    );
+    assert!(
+        !issue_codes_list(&result).contains(&issue_codes::UNRESOLVED_REFERENCE.to_string()),
+        "{:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn bare_input_of_a_second_flatten_belongs_to_the_table() {
+    let sql = r#"
+        SELECT customer_id, phone.value::STRING AS phone_number
+        FROM customers,
+        LATERAL FLATTEN(input => addresses) addr,
+        LATERAL FLATTEN(input => phone_numbers) phone
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "customer_id"),
+        expected_sources(&["customers.customer_id"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "phone_number"),
+        expected_sources(&["customers.phone_numbers"])
+    );
+    assert!(
+        !issue_codes_list(&result).contains(&issue_codes::UNRESOLVED_REFERENCE.to_string()),
+        "{:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn ambiguous_flatten_input_is_reported_once() {
+    // Without a schema `tags` may belong to either table. VALUE and THIS both
+    // carry it, yet it is one reference. FLATTEN has no `note`, so it is not
+    // named among the relations `note` may belong to.
+    let sql = r#"
+        SELECT note, f.value AS v
+        FROM orders o, customers c,
+        LATERAL FLATTEN(input => tags) f
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let unresolved: Vec<&str> = result
+        .issues
+        .iter()
+        .filter(|issue| issue.code == issue_codes::UNRESOLVED_REFERENCE)
+        .map(|issue| issue.message.as_str())
+        .collect();
+    assert_eq!(
+        unresolved,
+        vec![
+            "Column 'tags' is ambiguous across tables in scope: CUSTOMERS, ORDERS",
+            "Column 'note' is ambiguous across tables in scope: CUSTOMERS, ORDERS",
+        ]
+    );
+}
+
+#[test]
+fn lateral_table_function_other_than_flatten_is_reported() {
+    let sql = r#"
+        SELECT s.value AS part
+        FROM files t,
+        LATERAL SPLIT_TO_TABLE(t.csv, ',') s
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    assert!(
+        issue_codes_list(&result).contains(&issue_codes::UNSUPPORTED_SYNTAX.to_string()),
+        "{:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn flatten_adds_no_column_when_column_lineage_is_disabled() {
+    let sql = r#"
+        SELECT o.id, f.value AS v
+        FROM orders o,
+        LATERAL FLATTEN(input => o.tags) f
+    "#;
+
+    let result = run_analysis_with_options(
+        sql,
+        Dialect::Snowflake,
+        None,
+        AnalysisOptions {
+            enable_column_lineage: Some(false),
+            ..Default::default()
+        },
+    );
+    let stmt = first_statement(&result);
+
+    let tables: Vec<String> = stmt
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == NodeType::Table)
+        .map(|node| node.label.to_lowercase())
+        .collect();
+    assert_eq!(tables, vec!["orders".to_string()]);
+    assert!(
+        stmt.nodes
+            .iter()
+            .all(|node| matches!(node.node_type, NodeType::Table | NodeType::Output)),
+        "only relations should be emitted: {:?}",
+        stmt.nodes
+    );
+}
+
 #[test]
 fn snowflake_higher_order_functions_track_source() {
     let sql = r#"

@@ -10,6 +10,7 @@ use super::helpers::{
     alias_visibility_warning, find_cte_body_span, find_cte_definition_span,
     find_derived_table_alias_span, generate_statement_scoped_node_id,
 };
+use super::query::OutputColumnParams;
 use super::select_analyzer::SelectAnalyzer;
 use super::Analyzer;
 use crate::generated::is_value_table_function;
@@ -465,6 +466,106 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
         }
     }
 
+    /// Registers Snowflake's `LATERAL FLATTEN(INPUT => expr) AS f` as a
+    /// relation with the columns FLATTEN returns, so that `f.value` resolves.
+    ///
+    /// VALUE and THIS carry the input, so they derive from the columns it
+    /// reads, with the whole call as their expression. SEQ, KEY, PATH and
+    /// INDEX say where an element sits rather than carry it, and read nothing.
+    fn visit_flatten(
+        &mut self,
+        name: &ast::ObjectName,
+        args: &[ast::FunctionArg],
+        alias: Option<&TableAlias>,
+    ) {
+        // Unaliased, the columns are still read unqualified (`value`), so the
+        // relation needs a name all the same.
+        let alias_name = alias.map_or_else(|| name.to_string(), |a| a.name.to_string());
+        // What is read through the alias belongs to no table, so it stays out
+        // of the implied schema, as a derived table's columns do.
+        self.ctx
+            .register_subquery_alias_in_scope(alias_name.clone());
+        // At table level the input is a column of a relation already in the
+        // FROM clause: a FLATTEN node would have nothing to connect to.
+        if !self.analyzer.column_lineage_enabled {
+            return;
+        }
+        // An alias such as `f` is often reused by every CTE that flattens,
+        // and each use is a different relation.
+        let scope_id = self.ctx.current_scope_id().unwrap_or_default();
+        let node_id = self.ctx.add_node(Node {
+            id: generate_statement_scoped_node_id(
+                "flatten",
+                self.ctx.statement_index,
+                &format!("scope_{scope_id}::{alias_name}"),
+            ),
+            node_type: NodeType::Cte,
+            label: alias_name.clone().into(),
+            qualified_name: Some(alias_name.clone().into()),
+            ..Default::default()
+        });
+
+        let sources = match flatten_input(args) {
+            Some(input) => ExpressionAnalyzer::new(self.analyzer, self.ctx)
+                .extract_column_refs_with_warning(input),
+            None => Vec::new(),
+        };
+        // The input is read as a projected column is, so its table learns of it.
+        for source in &sources {
+            let table = source.table.as_deref();
+            if let Some(canonical) = table.and_then(|t| self.resolve_table_alias(Some(t))) {
+                self.ctx
+                    .record_source_column(&canonical, &source.column, None);
+            }
+        }
+        let call = format!(
+            "{name}({})",
+            args.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let checkpoint = self.ctx.projection_checkpoint();
+        for column in ["SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"] {
+            let carries_input = matches!(column, "VALUE" | "THIS");
+            if carries_input && !sources.is_empty() {
+                let reported = self.analyzer.issues.len();
+                self.analyzer.add_output_column_with_aggregation(
+                    self.ctx,
+                    OutputColumnParams {
+                        name: column.to_string(),
+                        sources: sources.clone(),
+                        expression: Some(call.clone()),
+                        data_type: None,
+                        target_node: Some(node_id.to_string()),
+                        approximate: false,
+                        aggregation: None,
+                    },
+                );
+                // THIS reads the input VALUE has just read, so whatever resolving
+                // it reports has been reported once already.
+                if column == "THIS" {
+                    self.analyzer.issues.truncate(reported);
+                }
+            } else {
+                self.analyzer
+                    .add_unsourced_column(self.ctx, column, &node_id);
+            }
+        }
+        let columns = self.ctx.take_output_columns_since(checkpoint);
+
+        // The six columns are all FLATTEN returns: a bare name it lacks
+        // belongs to another relation of the FROM clause.
+        self.ctx.mark_fixed_columns_in_scope(node_id.clone());
+        self.ctx
+            .register_table_in_scope(alias_name.clone(), node_id);
+        self.ctx
+            .register_alias_in_scope(alias_name.clone(), alias_name.clone());
+        self.ctx
+            .register_subquery_columns_in_scope(alias_name, columns);
+    }
+
     /// Emits a warning for unsupported alias usage in a clause.
     fn emit_alias_warning(&mut self, clause_name: &str, alias_name: &str) {
         let dialect = self.analyzer.request.dialect;
@@ -749,6 +850,34 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     .with_statement(self.ctx.statement_index),
                 );
             }
+            TableFactor::Function {
+                name, args, alias, ..
+            } if name.to_string().eq_ignore_ascii_case("flatten") => {
+                self.visit_flatten(name, args, alias.as_ref());
+            }
+            TableFactor::Function {
+                name, args, alias, ..
+            } => {
+                for expr in args.iter().filter_map(function_arg_expr) {
+                    self.extract_identifiers_from_expr(expr);
+                }
+                if is_value_table_function(self.analyzer.request.dialect, &name.to_string()) {
+                    self.ctx.mark_table_function_in_scope();
+                }
+                if let Some(a) = alias {
+                    self.ctx
+                        .register_subquery_alias_in_scope(a.name.to_string());
+                }
+                self.analyzer.issues.push(
+                    Issue::info(
+                        issue_codes::UNSUPPORTED_SYNTAX,
+                        format!(
+                            "Table function '{name}' lineage extracted with best-effort identifier matching"
+                        ),
+                    )
+                    .with_statement(self.ctx.statement_index),
+                );
+            }
             TableFactor::Pivot {
                 table,
                 aggregate_functions,
@@ -845,4 +974,46 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
             }
         }
     }
+}
+
+/// The expression passed to a table function argument, named or not.
+fn function_arg_expr(arg: &ast::FunctionArg) -> Option<&Expr> {
+    match arg {
+        ast::FunctionArg::Named {
+            arg: ast::FunctionArgExpr::Expr(expr),
+            ..
+        }
+        | ast::FunctionArg::ExprNamed {
+            arg: ast::FunctionArgExpr::Expr(expr),
+            ..
+        }
+        | ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Some(expr),
+        _ => None,
+    }
+}
+
+/// The value FLATTEN expands: its `INPUT =>` argument, or the first positional
+/// one. PATH, OUTER, RECURSIVE and MODE are constants.
+fn flatten_input(args: &[ast::FunctionArg]) -> Option<&Expr> {
+    let named = args.iter().find_map(|arg| {
+        let name = match arg {
+            ast::FunctionArg::Named { name, .. } => name,
+            ast::FunctionArg::ExprNamed {
+                name: Expr::Identifier(name),
+                ..
+            } => name,
+            _ => return None,
+        };
+        if name.value.eq_ignore_ascii_case("input") {
+            function_arg_expr(arg)
+        } else {
+            None
+        }
+    });
+    named.or_else(|| {
+        args.iter().find_map(|arg| match arg {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Some(expr),
+            _ => None,
+        })
+    })
 }
