@@ -7297,6 +7297,200 @@ fn long_concatenation_keeps_every_operand() {
     );
 }
 
+/// Sources of an output column as `relation.column`, lowercased, following
+/// derivation and data-flow edges to the relation that owns each source.
+fn source_columns_of(stmt: &StmtView<'_>, output: &str) -> HashSet<String> {
+    let target = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Column && node.label.eq_ignore_ascii_case(output))
+        .unwrap_or_else(|| panic!("output column {output} should exist"));
+    stmt.edges
+        .iter()
+        .filter(|edge| {
+            edge.to == target.id
+                && matches!(edge.edge_type, EdgeType::Derivation | EdgeType::DataFlow)
+        })
+        .filter_map(|edge| {
+            let source = stmt.nodes.iter().find(|node| node.id == edge.from)?;
+            let owner = stmt
+                .edges
+                .iter()
+                .find(|owned| owned.edge_type == EdgeType::Ownership && owned.to == source.id)
+                .and_then(|owned| stmt.nodes.iter().find(|node| node.id == owned.from))?;
+            Some(format!("{}.{}", owner.label, source.label).to_lowercase())
+        })
+        .collect()
+}
+
+fn expected_sources(sources: &[&str]) -> HashSet<String> {
+    sources.iter().map(|source| source.to_string()).collect()
+}
+
+#[test]
+fn trim_reads_the_column_of_the_relation_it_names() {
+    // Both relations have `name`. The column inside TRIM belongs to the joined
+    // relation, and must not be credited to the one the query is driven from.
+    let sql = r#"
+        SELECT o.id, TRIM(c.name) AS customer_name
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+    "#;
+    let schema = SchemaMetadata {
+        allow_implied: false,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![
+            schema_table(None, None, "orders", &["id", "customer_id", "name"]),
+            schema_table(None, None, "customers", &["id", "name"]),
+        ],
+    };
+
+    let result = run_analysis(sql, Dialect::Generic, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        source_columns_of(&stmt, "customer_name"),
+        expected_sources(&["customers.name"])
+    );
+}
+
+#[test]
+fn dedicated_expression_forms_read_every_operand() {
+    // SUBSTR, CEIL, POSITION and the `:` path operator parse to their own
+    // expression variants rather than to function calls.
+    let sql = r#"
+        SELECT
+            SUBSTR(code, 1, 2) || suffix AS short_code,
+            CEIL(amount) + fee AS total,
+            payload:kind::STRING || suffix AS tagged,
+            POSITION('-' IN code) + fee AS dash_at
+        FROM events
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    for (output, sources) in [
+        ("short_code", ["events.code", "events.suffix"]),
+        ("total", ["events.amount", "events.fee"]),
+        ("tagged", ["events.payload", "events.suffix"]),
+        ("dash_at", ["events.code", "events.fee"]),
+    ] {
+        assert_eq!(
+            source_columns_of(&stmt, output),
+            expected_sources(&sources),
+            "sources of {output}"
+        );
+    }
+}
+
+#[test]
+fn lateral_alias_inside_trim_resolves_to_its_sources() {
+    // Keys hashed from earlier keys of the same SELECT list: the lateral
+    // aliases are only visible inside TRIM.
+    let sql = r#"
+        SELECT
+            MD5(UPPER(TRIM(CAST(order_id AS VARCHAR)))) AS order_key,
+            MD5(UPPER(TRIM(CAST(customer_id AS VARCHAR)))) AS customer_key,
+            MD5(CONCAT(
+                UPPER(TRIM(CAST(order_key AS VARCHAR))), '||',
+                UPPER(TRIM(CAST(customer_key AS VARCHAR)))
+            )) AS link_key
+        FROM orders
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    assert_eq!(
+        source_columns_of(&stmt, "link_key"),
+        expected_sources(&["orders.order_id", "orders.customer_id"])
+    );
+}
+
+#[test]
+fn filter_inside_trim_is_attached_to_its_table() {
+    let sql = r#"
+        SELECT o.id
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE TRIM(c.status) = 'active'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+    let customers = find_table_node(&stmt, "customers").expect("customers table not found");
+    let orders = find_table_node(&stmt, "orders").expect("orders table not found");
+    assert_eq!(
+        customers
+            .filters
+            .iter()
+            .map(|filter| filter.expression.as_str())
+            .collect::<Vec<_>>(),
+        ["TRIM(c.status) = 'active'"]
+    );
+    assert!(orders.filters.is_empty(), "orders: {:?}", orders.filters);
+}
+
+#[test]
+fn in_subquery_reads_its_left_operand_only() {
+    // The subquery is analysed in its own scope, so its columns are not
+    // sources of the flag; the value tested against it is.
+    let sql = r#"
+        SELECT
+            o.id,
+            CASE WHEN o.customer_id IN (SELECT c.id FROM customers c) THEN 1 ELSE 0 END AS known
+        FROM orders o
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+    assert_eq!(
+        source_columns_of(&stmt, "known"),
+        expected_sources(&["orders.customer_id"])
+    );
+}
+
+#[test]
+fn lambda_parameters_are_not_read_as_columns() {
+    let sql = r#"
+        SELECT list_transform(prices, p -> p * rate) AS scaled
+        FROM products
+    "#;
+
+    let result = run_analysis(sql, Dialect::Duckdb, None);
+    let stmt = first_statement(&result);
+    let sources = source_columns_of(&stmt, "scaled");
+    assert!(
+        !sources.iter().any(|source| source.ends_with(".p")),
+        "a lambda parameter is not a column: {sources:?}"
+    );
+    assert!(sources.contains("products.prices"), "sources: {sources:?}");
+}
+
+#[test]
+fn subscript_of_a_qualified_column_reads_that_column() {
+    // `o.items[1]` parses as the root `o` with the steps `.items` and `[1]`.
+    // The root is the table alias, not a column of orders.
+    let sql = "SELECT o.id, o.items[1] AS first_item FROM orders o";
+    let schema = SchemaMetadata {
+        allow_implied: false,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![schema_table(None, None, "orders", &["id", "items"])],
+    };
+
+    let result = run_analysis(sql, Dialect::Postgres, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        source_columns_of(&stmt, "first_item"),
+        expected_sources(&["orders.items"])
+    );
+    assert!(result.issues.is_empty(), "issues: {:?}", result.issues);
+}
+
 #[test]
 fn case_with_aggregate_in_condition() {
     // CASE with aggregate function in WHEN condition

@@ -48,6 +48,30 @@ fn binary_op_operands(expr: &Expr) -> Vec<&Expr> {
     operands
 }
 
+/// Splits a field access into the name it starts from and the steps after it.
+///
+/// The parser keeps `o.items[1]` as the root `o` followed by the steps `.items`
+/// and `[1]`. The name is `o.items`, read as it would be without the subscript,
+/// and the steps after it are fields and subscripts of its value. The name is
+/// empty when the root is not an identifier.
+fn split_access_name<'e>(
+    root: &'e Expr,
+    access_chain: &'e [ast::AccessExpr],
+) -> (Vec<&'e ast::Ident>, &'e [ast::AccessExpr]) {
+    let Expr::Identifier(first) = root else {
+        return (Vec::new(), access_chain);
+    };
+    let mut name = vec![first];
+    for step in access_chain {
+        match step {
+            ast::AccessExpr::Dot(Expr::Identifier(part)) => name.push(part),
+            _ => break,
+        }
+    }
+    let steps = &access_chain[name.len() - 1..];
+    (name, steps)
+}
+
 /// Analyzes SQL expressions to extract column references, detect aggregations,
 /// and capture filter predicates.
 ///
@@ -277,6 +301,10 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                                 FunctionArg::Named {
                                     arg: FunctionArgExpr::Expr(e),
                                     ..
+                                }
+                                | FunctionArg::ExprNamed {
+                                    arg: FunctionArgExpr::Expr(e),
+                                    ..
                                 } => {
                                     depth_limited |=
                                         Self::collect_column_refs(e, refs, dialect, next_depth);
@@ -314,7 +342,7 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             Expr::Nested(inner) => {
                 depth_limited |= Self::collect_column_refs(inner, refs, dialect, next_depth);
             }
-            Expr::Subquery(_) => {
+            Expr::Subquery(_) | Expr::Exists { .. } => {
                 // Subquery columns are handled separately
             }
             Expr::InList { expr, list, .. } => {
@@ -348,9 +376,207 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             Expr::Extract { expr, .. } => {
                 depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
             }
-            _ => {
-                // Other expressions don't contain column references or are handled elsewhere
+            // The parser gives TRIM, SUBSTRING, CEIL, `col:path` and the like
+            // variants of their own rather than function calls. There is no
+            // catch-all arm, so a variant added to sqlparser is a compile error
+            // here instead of a column that silently drops out of lineage.
+            Expr::IsUnknown(e)
+            | Expr::IsNotUnknown(e)
+            | Expr::IsNormalized { expr: e, .. }
+            | Expr::Ceil { expr: e, .. }
+            | Expr::Floor { expr: e, .. }
+            | Expr::Collate { expr: e, .. }
+            | Expr::Prefixed { value: e, .. }
+            | Expr::Named { expr: e, .. }
+            | Expr::OuterJoin(e)
+            | Expr::Prior(e) => {
+                depth_limited |= Self::collect_column_refs(e, refs, dialect, next_depth);
             }
+            Expr::Interval(interval) => {
+                depth_limited |=
+                    Self::collect_column_refs(&interval.value, refs, dialect, next_depth);
+            }
+            Expr::IsDistinctFrom(left, right)
+            | Expr::IsNotDistinctFrom(left, right)
+            | Expr::AnyOp { left, right, .. }
+            | Expr::AllOp { left, right, .. }
+            | Expr::SimilarTo {
+                expr: left,
+                pattern: right,
+                ..
+            }
+            | Expr::RLike {
+                expr: left,
+                pattern: right,
+                ..
+            }
+            | Expr::Position {
+                expr: left,
+                r#in: right,
+            }
+            | Expr::AtTimeZone {
+                timestamp: left,
+                time_zone: right,
+            }
+            | Expr::InUnnest {
+                expr: left,
+                array_expr: right,
+                ..
+            } => {
+                depth_limited |= Self::collect_column_refs(left, refs, dialect, next_depth);
+                depth_limited |= Self::collect_column_refs(right, refs, dialect, next_depth);
+            }
+            Expr::MemberOf(member_of) => {
+                depth_limited |=
+                    Self::collect_column_refs(&member_of.value, refs, dialect, next_depth);
+                depth_limited |=
+                    Self::collect_column_refs(&member_of.array, refs, dialect, next_depth);
+            }
+            Expr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
+                if let Some(what) = trim_what {
+                    depth_limited |= Self::collect_column_refs(what, refs, dialect, next_depth);
+                }
+                for characters in trim_characters.iter().flatten() {
+                    depth_limited |=
+                        Self::collect_column_refs(characters, refs, dialect, next_depth);
+                }
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
+                for bound in [substring_from, substring_for].into_iter().flatten() {
+                    depth_limited |= Self::collect_column_refs(bound, refs, dialect, next_depth);
+                }
+            }
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
+                depth_limited |= Self::collect_column_refs(overlay_what, refs, dialect, next_depth);
+                depth_limited |= Self::collect_column_refs(overlay_from, refs, dialect, next_depth);
+                if let Some(length) = overlay_for {
+                    depth_limited |= Self::collect_column_refs(length, refs, dialect, next_depth);
+                }
+            }
+            Expr::Convert { expr, styles, .. } => {
+                depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
+                for style in styles {
+                    depth_limited |= Self::collect_column_refs(style, refs, dialect, next_depth);
+                }
+            }
+            // A dot step names a field of the value, not a column of the query;
+            // a subscript or bracket key is an expression and can read one.
+            Expr::JsonAccess { value, path } => {
+                depth_limited |= Self::collect_column_refs(value, refs, dialect, next_depth);
+                for elem in &path.path {
+                    if let ast::JsonPathElem::Bracket { key } = elem {
+                        depth_limited |= Self::collect_column_refs(key, refs, dialect, next_depth);
+                    }
+                }
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let (name, steps) = split_access_name(root, access_chain);
+                match name.split_last() {
+                    Some((column, table)) if !table.is_empty() => refs.push(ColumnRef {
+                        table: Some(
+                            table
+                                .iter()
+                                .map(|part| part.value.as_str())
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        ),
+                        column: column.value.clone(),
+                    }),
+                    _ => {
+                        depth_limited |= Self::collect_column_refs(root, refs, dialect, next_depth);
+                    }
+                }
+                for access in steps {
+                    match access {
+                        ast::AccessExpr::Dot(_) => {}
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            depth_limited |=
+                                Self::collect_column_refs(index, refs, dialect, next_depth);
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => {
+                            for bound in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                                depth_limited |=
+                                    Self::collect_column_refs(bound, refs, dialect, next_depth);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Struct { values: exprs, .. } | Expr::Array(ast::Array { elem: exprs, .. }) => {
+                for e in exprs {
+                    depth_limited |= Self::collect_column_refs(e, refs, dialect, next_depth);
+                }
+            }
+            Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => {
+                for e in sets.iter().flatten() {
+                    depth_limited |= Self::collect_column_refs(e, refs, dialect, next_depth);
+                }
+            }
+            Expr::Dictionary(fields) => {
+                for field in fields {
+                    depth_limited |=
+                        Self::collect_column_refs(&field.value, refs, dialect, next_depth);
+                }
+            }
+            Expr::Map(map) => {
+                for entry in &map.entries {
+                    depth_limited |=
+                        Self::collect_column_refs(&entry.key, refs, dialect, next_depth);
+                    depth_limited |=
+                        Self::collect_column_refs(&entry.value, refs, dialect, next_depth);
+                }
+            }
+            Expr::MatchAgainst { columns, .. } => {
+                for name in columns {
+                    let mut parts = name.0.iter().filter_map(|part| part.as_ident());
+                    let Some(column) = parts.next_back() else {
+                        continue;
+                    };
+                    let table = parts.map(|i| i.value.as_str()).collect::<Vec<_>>();
+                    refs.push(ColumnRef {
+                        table: (!table.is_empty()).then(|| table.join(".")),
+                        column: column.value.clone(),
+                    });
+                }
+            }
+            Expr::InSubquery { expr, .. } => {
+                // The value tested is read here; the subquery has its own scope
+                // and is analysed separately.
+                depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
+            }
+            Expr::Lambda(_) => {
+                // Reading the body would take the lambda's parameters for
+                // columns of the enclosing query.
+            }
+            Expr::CompoundIdentifier(_) => {
+                // The parser never builds a compound name of fewer than two parts.
+            }
+            Expr::Value(_)
+            | Expr::TypedString(_)
+            | Expr::Wildcard(_)
+            | Expr::QualifiedWildcard(..) => {}
         }
 
         depth_limited
@@ -693,6 +919,9 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
         identifiers
     }
 
+    /// Walks the same forms as `collect_column_refs`. A lateral alias that
+    /// lineage reads but this walk misses is never substituted, so it stays a
+    /// column reference and is resolved against the tables in scope.
     fn collect_simple_identifiers(expr: &Expr, identifiers: &mut HashSet<String>, depth: usize) {
         if depth > MAX_RECURSION_DEPTH {
             #[cfg(feature = "tracing")]
@@ -725,8 +954,16 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             | Expr::IsNotTrue(e)
             | Expr::IsUnknown(e)
             | Expr::IsNotUnknown(e)
-            | Expr::JsonAccess { value: e, .. } => {
+            | Expr::IsNormalized { expr: e, .. }
+            | Expr::Collate { expr: e, .. }
+            | Expr::Prefixed { value: e, .. }
+            | Expr::Named { expr: e, .. }
+            | Expr::OuterJoin(e)
+            | Expr::Prior(e) => {
                 Self::collect_simple_identifiers(e, identifiers, next_depth);
+            }
+            Expr::Interval(interval) => {
+                Self::collect_simple_identifiers(&interval.value, identifiers, next_depth);
             }
 
             // Two expression patterns (left/right)
@@ -771,6 +1008,10 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                 Self::collect_simple_identifiers(e1, identifiers, next_depth);
                 Self::collect_simple_identifiers(e2, identifiers, next_depth);
             }
+            Expr::MemberOf(member_of) => {
+                Self::collect_simple_identifiers(&member_of.value, identifiers, next_depth);
+                Self::collect_simple_identifiers(&member_of.array, identifiers, next_depth);
+            }
 
             // Three expression patterns
             Expr::Between {
@@ -782,7 +1023,9 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             }
 
             // List patterns
-            Expr::Tuple(exprs) => {
+            Expr::Tuple(exprs)
+            | Expr::Struct { values: exprs, .. }
+            | Expr::Array(ast::Array { elem: exprs, .. }) => {
                 for e in exprs {
                     Self::collect_simple_identifiers(e, identifiers, next_depth);
                 }
@@ -793,6 +1036,22 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                     Self::collect_simple_identifiers(e, identifiers, next_depth);
                 }
             }
+            Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => {
+                for e in sets.iter().flatten() {
+                    Self::collect_simple_identifiers(e, identifiers, next_depth);
+                }
+            }
+            Expr::Dictionary(fields) => {
+                for field in fields {
+                    Self::collect_simple_identifiers(&field.value, identifiers, next_depth);
+                }
+            }
+            Expr::Map(map) => {
+                for entry in &map.entries {
+                    Self::collect_simple_identifiers(&entry.key, identifiers, next_depth);
+                    Self::collect_simple_identifiers(&entry.value, identifiers, next_depth);
+                }
+            }
 
             // Function arguments
             Expr::Function(func) => {
@@ -801,6 +1060,10 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                         match arg {
                             FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
                             | FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            }
+                            | FunctionArg::ExprNamed {
                                 arg: FunctionArgExpr::Expr(e),
                                 ..
                             } => Self::collect_simple_identifiers(e, identifiers, next_depth),
@@ -845,8 +1108,84 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                 }
             }
 
+            Expr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                Self::collect_simple_identifiers(expr, identifiers, next_depth);
+                if let Some(what) = trim_what {
+                    Self::collect_simple_identifiers(what, identifiers, next_depth);
+                }
+                for characters in trim_characters.iter().flatten() {
+                    Self::collect_simple_identifiers(characters, identifiers, next_depth);
+                }
+            }
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                Self::collect_simple_identifiers(expr, identifiers, next_depth);
+                Self::collect_simple_identifiers(overlay_what, identifiers, next_depth);
+                Self::collect_simple_identifiers(overlay_from, identifiers, next_depth);
+                if let Some(length) = overlay_for {
+                    Self::collect_simple_identifiers(length, identifiers, next_depth);
+                }
+            }
+            Expr::Convert { expr, styles, .. } => {
+                Self::collect_simple_identifiers(expr, identifiers, next_depth);
+                for style in styles {
+                    Self::collect_simple_identifiers(style, identifiers, next_depth);
+                }
+            }
+            Expr::JsonAccess { value, path } => {
+                Self::collect_simple_identifiers(value, identifiers, next_depth);
+                for elem in &path.path {
+                    if let ast::JsonPathElem::Bracket { key } = elem {
+                        Self::collect_simple_identifiers(key, identifiers, next_depth);
+                    }
+                }
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let (name, steps) = split_access_name(root, access_chain);
+                // `o.items[1]` names a qualified column, which is no simple identifier.
+                if name.len() < 2 {
+                    Self::collect_simple_identifiers(root, identifiers, next_depth);
+                }
+                for access in steps {
+                    match access {
+                        ast::AccessExpr::Dot(_) => {}
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            Self::collect_simple_identifiers(index, identifiers, next_depth);
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => {
+                            for bound in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                                Self::collect_simple_identifiers(bound, identifiers, next_depth);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::MatchAgainst { columns, .. } => {
+                for name in columns {
+                    if let [ast::ObjectNamePart::Identifier(ident)] = name.0.as_slice() {
+                        identifiers.insert(ident.value.clone());
+                    }
+                }
+            }
+            Expr::InSubquery { expr, .. } => {
+                Self::collect_simple_identifiers(expr, identifiers, next_depth);
+            }
+
             // Skip subqueries - they have their own scope
-            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {}
+            Expr::Subquery(_) | Expr::Exists { .. } => {}
 
             // Skip qualified names (table.column) - not simple identifiers
             Expr::CompoundIdentifier(_) => {}
@@ -926,6 +1265,112 @@ mod tests {
         let hit = ExpressionAnalyzer::collect_column_refs(&expr, &mut refs, Dialect::Generic, 0);
 
         assert!(hit, "nesting past the limit should still trigger the guard");
+    }
+
+    /// Expressions whose operands the parser keeps outside function arguments,
+    /// with the columns each one reads, qualified as written.
+    const DEDICATED_FORMS: &[(Dialect, &str, &[&str])] = &[
+        (
+            Dialect::Generic,
+            "TRIM(BOTH pad FROM c.name)",
+            &["c.name", "pad"],
+        ),
+        (Dialect::Snowflake, "TRIM(name, pad)", &["name", "pad"]),
+        (
+            Dialect::Generic,
+            "SUBSTRING(name FROM start FOR len)",
+            &["name", "start", "len"],
+        ),
+        (
+            Dialect::Generic,
+            "POSITION(needle IN hay)",
+            &["needle", "hay"],
+        ),
+        (
+            Dialect::Generic,
+            "CEIL(amount) + FLOOR(fee)",
+            &["amount", "fee"],
+        ),
+        (Dialect::Generic, "ts AT TIME ZONE zone", &["ts", "zone"]),
+        (Dialect::Generic, "a IS DISTINCT FROM b", &["a", "b"]),
+        (Dialect::Generic, "flag IS UNKNOWN", &["flag"]),
+        (
+            Dialect::Snowflake,
+            "payload:items[pos]",
+            &["payload", "pos"],
+        ),
+        (Dialect::Postgres, "items[pos].field", &["items", "pos"]),
+        (Dialect::Postgres, "t.items[pos]", &["t.items", "pos"]),
+        (Dialect::Duckdb, "s.t.items[1].field", &["s.t.items"]),
+        (Dialect::Postgres, "name COLLATE \"C\"", &["name"]),
+        (
+            Dialect::Postgres,
+            "OVERLAY(name PLACING patch FROM 2 FOR len)",
+            &["name", "patch", "len"],
+        ),
+        (
+            Dialect::Postgres,
+            "name SIMILAR TO pattern",
+            &["name", "pattern"],
+        ),
+        (Dialect::Mysql, "name RLIKE pattern", &["name", "pattern"]),
+        (Dialect::Postgres, "a = ANY(b)", &["a", "b"]),
+        (Dialect::Mysql, "CONVERT(amount, CHAR)", &["amount"]),
+        (Dialect::Postgres, "ARRAY[a, b]", &["a", "b"]),
+        (Dialect::Postgres, "f(arg => col)", &["col"]),
+        (Dialect::Mysql, "DATE_ADD(d, INTERVAL n DAY)", &["d", "n"]),
+        (
+            Dialect::Mysql,
+            "MATCH (title, t.body) AGAINST ('x')",
+            &["title", "t.body"],
+        ),
+        (Dialect::Generic, "x IN (SELECT y FROM t)", &["x"]),
+        (Dialect::Generic, "EXISTS (SELECT y FROM t)", &[]),
+        (Dialect::Duckdb, "list_transform(xs, x -> x + 1)", &["xs"]),
+    ];
+
+    fn parse_expr(sql: &str, dialect: Dialect) -> Expr {
+        sqlparser::parser::Parser::new(dialect.to_sqlparser_dialect().as_ref())
+            .try_with_sql(sql)
+            .and_then(|mut parser| parser.parse_expr())
+            .unwrap_or_else(|err| panic!("{sql} should parse: {err}"))
+    }
+
+    #[test]
+    fn collect_column_refs_reads_operands_of_dedicated_forms() {
+        for &(dialect, sql, expected) in DEDICATED_FORMS {
+            let (refs, hit) = ExpressionAnalyzer::extract_column_refs_with_dialect(
+                &parse_expr(sql, dialect),
+                dialect,
+            );
+
+            assert!(!hit, "{sql} should not trigger the guard");
+            let columns: Vec<String> = refs
+                .into_iter()
+                .map(|col_ref| match col_ref.table {
+                    Some(table) => format!("{table}.{}", col_ref.column),
+                    None => col_ref.column,
+                })
+                .collect();
+            assert_eq!(columns, expected, "columns read by {sql}");
+        }
+    }
+
+    #[test]
+    fn extract_simple_identifiers_sees_what_collect_column_refs_reads() {
+        for &(dialect, sql, expected) in DEDICATED_FORMS {
+            let unqualified: HashSet<String> = expected
+                .iter()
+                .filter(|column| !column.contains('.'))
+                .map(|column| column.to_string())
+                .collect();
+
+            assert_eq!(
+                ExpressionAnalyzer::extract_simple_identifiers(&parse_expr(sql, dialect)),
+                unqualified,
+                "bare identifiers of {sql}"
+            );
+        }
     }
 
     #[test]
