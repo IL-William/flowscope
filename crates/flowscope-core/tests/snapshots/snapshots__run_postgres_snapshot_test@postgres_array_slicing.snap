@@ -49,6 +49,32 @@ expression: clean_result
       "expression": "c[2:]"
     },
     {
+      "id": "column_95b826196d892dac",
+      "type": "column",
+      "label": "c",
+      "qualifiedName": "array_data.c",
+      "canonicalName": {
+        "schema": "array_data",
+        "name": "c"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "column_b683e029cadda1d4",
+      "type": "column",
+      "label": "a",
+      "qualifiedName": "array_data.a",
+      "canonicalName": {
+        "schema": "array_data",
+        "name": "a"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
       "id": "column_bceb3c4d983131c5",
       "type": "column",
       "label": "col_3",
@@ -59,6 +85,32 @@ expression: clean_result
         0
       ],
       "expression": "d[2:3]"
+    },
+    {
+      "id": "column_c4a845893b35a6fa",
+      "type": "column",
+      "label": "b",
+      "qualifiedName": "array_data.b",
+      "canonicalName": {
+        "schema": "array_data",
+        "name": "b"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "column_ea9f00345477a676",
+      "type": "column",
+      "label": "d",
+      "qualifiedName": "array_data.d",
+      "canonicalName": {
+        "schema": "array_data",
+        "name": "d"
+      },
+      "statementIds": [
+        0
+      ]
     },
     {
       "id": "output_74d22f755ec62dbc",
@@ -100,11 +152,58 @@ expression: clean_result
   ],
   "edges": [
     {
-      "id": "edge_550b27dba85a2465",
+      "id": "edge_16ba963d993199aa",
+      "from": "column_95b826196d892dac",
+      "to": "column_84c9f50405fdf52c",
+      "type": "derivation",
+      "expression": "c[2:]",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_1d5f16b94e24d605",
       "from": "table_eb6f82b7323d024e",
+      "to": "column_c4a845893b35a6fa",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_29829752b6d6e0ac",
+      "from": "column_ea9f00345477a676",
       "to": "column_bceb3c4d983131c5",
       "type": "derivation",
       "expression": "d[2:3]",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_30772b2aeea20852",
+      "from": "table_eb6f82b7323d024e",
+      "to": "column_ea9f00345477a676",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_675b380196aa1111",
+      "from": "table_eb6f82b7323d024e",
+      "to": "column_95b826196d892dac",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_75998b7fa2f4cdb8",
+      "from": "column_b683e029cadda1d4",
+      "to": "column_7748741d00eb4aa0",
+      "type": "derivation",
+      "expression": "a[:]",
       "statementIds": [
         0
       ]
@@ -119,26 +218,6 @@ expression: clean_result
       ]
     },
     {
-      "id": "edge_8128a9fd6e58dbf4",
-      "from": "table_eb6f82b7323d024e",
-      "to": "column_7748741d00eb4aa0",
-      "type": "derivation",
-      "expression": "a[:]",
-      "statementIds": [
-        0
-      ]
-    },
-    {
-      "id": "edge_91d9a3175fef27e4",
-      "from": "table_eb6f82b7323d024e",
-      "to": "column_6d76c5c7b69b69cb",
-      "type": "derivation",
-      "expression": "b[:1]",
-      "statementIds": [
-        0
-      ]
-    },
-    {
       "id": "edge_96c8fa1504967783",
       "from": "output_74d22f755ec62dbc",
       "to": "column_84c9f50405fdf52c",
@@ -148,11 +227,20 @@ expression: clean_result
       ]
     },
     {
-      "id": "edge_ad3bc1a5b25c59cc",
+      "id": "edge_a4180dafa0264175",
       "from": "table_eb6f82b7323d024e",
-      "to": "column_84c9f50405fdf52c",
+      "to": "column_b683e029cadda1d4",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_dd32db879aa8c27f",
+      "from": "column_c4a845893b35a6fa",
+      "to": "column_6d76c5c7b69b69cb",
       "type": "derivation",
-      "expression": "c[2:]",
+      "expression": "b[:1]",
       "statementIds": [
         0
       ]
@@ -180,7 +268,7 @@ expression: clean_result
   "summary": {
     "statementCount": 1,
     "tableCount": 1,
-    "columnCount": 4,
+    "columnCount": 8,
     "joinCount": 0,
     "complexityScore": 5,
     "issueCount": {
