@@ -28,6 +28,26 @@ use tracing::debug;
 /// on maliciously crafted or deeply nested SQL expressions.
 pub(super) const MAX_RECURSION_DEPTH: usize = 100;
 
+/// Returns the operands of a chain of binary operators, left to right.
+///
+/// The parser builds `a || b || c` as `(a || b) || c`, so each operator of a
+/// flat chain adds one level on the left. Walking that spine in a loop keeps
+/// the length of a chain from counting against `MAX_RECURSION_DEPTH`, which
+/// guards real nesting: otherwise a surrogate key concatenating fifty columns
+/// and their separators loses its leftmost operands. Right operands are still
+/// visited by recursion, so nesting on that side keeps counting.
+fn binary_op_operands(expr: &Expr) -> Vec<&Expr> {
+    let mut operands = Vec::new();
+    let mut current = expr;
+    while let Expr::BinaryOp { left, right, .. } = current {
+        operands.push(right.as_ref());
+        current = left;
+    }
+    operands.push(current);
+    operands.reverse();
+    operands
+}
+
 /// Analyzes SQL expressions to extract column references, detect aggregations,
 /// and capture filter predicates.
 ///
@@ -114,9 +134,10 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                 self.analyzer.analyze_query(self.ctx, subquery, None)
             }
             Expr::Exists { subquery, .. } => self.analyzer.analyze_query(self.ctx, subquery, None),
-            Expr::BinaryOp { left, right, .. } => {
-                self.visit_expression_for_subqueries(left, next_depth);
-                self.visit_expression_for_subqueries(right, next_depth);
+            Expr::BinaryOp { .. } => {
+                for operand in binary_op_operands(expr) {
+                    self.visit_expression_for_subqueries(operand, next_depth);
+                }
             }
             Expr::UnaryOp { expr, .. } => self.visit_expression_for_subqueries(expr, next_depth),
             Expr::Nested(expr) => self.visit_expression_for_subqueries(expr, next_depth),
@@ -230,9 +251,10 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                     column,
                 });
             }
-            Expr::BinaryOp { left, right, .. } => {
-                depth_limited |= Self::collect_column_refs(left, refs, dialect, next_depth);
-                depth_limited |= Self::collect_column_refs(right, refs, dialect, next_depth);
+            Expr::BinaryOp { .. } => {
+                for operand in binary_op_operands(expr) {
+                    depth_limited |= Self::collect_column_refs(operand, refs, dialect, next_depth);
+                }
             }
             Expr::UnaryOp { expr, .. } => {
                 depth_limited |= Self::collect_column_refs(expr, refs, dialect, next_depth);
@@ -424,9 +446,9 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
 
         match expr {
             Expr::Function(func) => self.check_function_for_aggregate(func, next_depth),
-            Expr::BinaryOp { left, right, .. } => self
-                .find_aggregate_function(left, next_depth)
-                .or_else(|| self.find_aggregate_function(right, next_depth)),
+            Expr::BinaryOp { .. } => binary_op_operands(expr)
+                .into_iter()
+                .find_map(|operand| self.find_aggregate_function(operand, next_depth)),
             Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
                 self.find_aggregate_function(expr, next_depth)
             }
@@ -708,9 +730,12 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             }
 
             // Two expression patterns (left/right)
-            Expr::BinaryOp { left, right, .. }
-            | Expr::AnyOp { left, right, .. }
-            | Expr::AllOp { left, right, .. } => {
+            Expr::BinaryOp { .. } => {
+                for operand in binary_op_operands(expr) {
+                    Self::collect_simple_identifiers(operand, identifiers, next_depth);
+                }
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
                 Self::collect_simple_identifiers(left, identifiers, next_depth);
                 Self::collect_simple_identifiers(right, identifiers, next_depth);
             }
@@ -850,6 +875,68 @@ mod tests {
         assert!(
             refs.is_empty(),
             "no column refs should be recorded when guard triggers"
+        );
+    }
+
+    fn column(index: usize) -> Expr {
+        Expr::Identifier(ast::Ident::new(format!("c{index}")))
+    }
+
+    fn concat(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op: ast::BinaryOperator::StringConcat,
+            right: Box::new(right),
+        }
+    }
+
+    /// `c0 || c1 || ... || c{len - 1}`, left-deep as the parser builds it.
+    fn flat_concat_chain(len: usize) -> Expr {
+        (1..len).fold(column(0), |chain, index| concat(chain, column(index)))
+    }
+
+    #[test]
+    fn collect_column_refs_walks_long_operator_chains() {
+        let len = MAX_RECURSION_DEPTH * 3;
+        let mut refs = Vec::new();
+        let hit = ExpressionAnalyzer::collect_column_refs(
+            &flat_concat_chain(len),
+            &mut refs,
+            Dialect::Generic,
+            0,
+        );
+
+        assert!(!hit, "a flat operator chain should not trigger the guard");
+        let columns: Vec<String> = refs.into_iter().map(|col_ref| col_ref.column).collect();
+        let expected: Vec<String> = (0..len).map(|index| format!("c{index}")).collect();
+        assert_eq!(
+            columns, expected,
+            "operands should be collected left to right"
+        );
+    }
+
+    #[test]
+    fn collect_column_refs_still_limits_nesting_on_the_right() {
+        let expr = (0..=MAX_RECURSION_DEPTH)
+            .rev()
+            .fold(column(MAX_RECURSION_DEPTH + 1), |nested, index| {
+                concat(column(index), nested)
+            });
+        let mut refs = Vec::new();
+        let hit = ExpressionAnalyzer::collect_column_refs(&expr, &mut refs, Dialect::Generic, 0);
+
+        assert!(hit, "nesting past the limit should still trigger the guard");
+    }
+
+    #[test]
+    fn extract_simple_identifiers_walks_long_operator_chains() {
+        let len = MAX_RECURSION_DEPTH * 3;
+        let identifiers = ExpressionAnalyzer::extract_simple_identifiers(&flat_concat_chain(len));
+
+        assert_eq!(
+            identifiers.len(),
+            len,
+            "every operand of a flat chain should be collected"
         );
     }
 }
