@@ -865,13 +865,20 @@ impl<'a> Analyzer<'a> {
                 }
             }
             0 => {
-                // No candidates found - if there's only one relation instance in scope, use it
-                // (the column might exist but not be in our schema)
-                if relation_instances.len() == 1 {
-                    return Some(relation_instances[0].canonical.clone());
+                // No candidates found - if only one relation instance in scope may have
+                // columns we do not know of, use it (the column might exist but not be in
+                // our schema). A FLATTEN has none, so it cannot own the column.
+                let owners = ctx.open_relation_instances_in_current_scope();
+                if owners.len() == 1 {
+                    return Some(owners[0].canonical.clone());
                 }
                 // Multiple tables but column not found in any - ambiguous
-                let mut sorted_tables: Vec<_> = relation_instances
+                let listed = if owners.is_empty() {
+                    &relation_instances
+                } else {
+                    &owners
+                };
+                let mut sorted_tables: Vec<_> = listed
                     .iter()
                     .map(|instance| instance.canonical.clone())
                     .collect();
@@ -1208,6 +1215,40 @@ impl<'a> Analyzer<'a> {
         ctx.output_columns.push(OutputColumn {
             name: normalized_name,
             data_type: params.data_type,
+            node_id,
+        });
+    }
+
+    /// Adds a column that `target_node` produces without reading any column,
+    /// such as the position of an element in a flattened array.
+    ///
+    /// Unlike a source-less projection, the column is not attributed to the
+    /// relations in scope: it describes the relation that owns it.
+    pub(super) fn add_unsourced_column(
+        &mut self,
+        ctx: &mut StatementContext,
+        name: &str,
+        target_node: &Arc<str>,
+    ) {
+        let normalized_name = self.normalize_identifier(name);
+        let node_id = generate_column_node_id(Some(target_node), &normalized_name);
+        ctx.add_node(Node {
+            id: node_id.clone(),
+            node_type: NodeType::Column,
+            label: normalized_name.clone().into(),
+            ..Default::default()
+        });
+        let edge_id = generate_edge_id(target_node, &node_id);
+        if !ctx.edge_ids.contains(&edge_id) {
+            ctx.add_edge(Edge::ownership(
+                edge_id,
+                target_node.clone(),
+                node_id.clone(),
+            ));
+        }
+        ctx.output_columns.push(OutputColumn {
+            name: normalized_name,
+            data_type: None,
             node_id,
         });
     }
