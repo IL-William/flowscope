@@ -7259,6 +7259,45 @@ fn deeply_nested_case_expressions() {
 }
 
 #[test]
+fn long_concatenation_keeps_every_operand() {
+    // A generated surrogate key joins every field with a separator, so 120
+    // fields parse as a left-deep chain of 238 `||` operators.
+    let fields: Vec<String> = (0..120).map(|i| format!("field_{i:03}")).collect();
+    let key = fields
+        .iter()
+        .map(|field| format!("COALESCE(CAST({field} AS VARCHAR), '')"))
+        .collect::<Vec<_>>()
+        .join(" || '-' || ");
+    let sql = format!("SELECT MD5({key}) AS row_key FROM events");
+
+    let result = run_analysis(&sql, Dialect::Generic, None);
+    assert!(
+        !issue_codes_list(&result).contains(&issue_codes::APPROXIMATE_LINEAGE.to_string()),
+        "a flat operator chain is not deep nesting, issues: {:?}",
+        result.issues
+    );
+
+    let stmt = first_statement(&result);
+    let row_key = find_column_node(&stmt, "row_key").expect("row_key column should exist");
+    let sources: HashSet<&str> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::Derivation && edge.to == row_key.id)
+        .filter_map(|edge| stmt.nodes.iter().find(|node| node.id == edge.from))
+        .map(|node| &*node.label)
+        .collect();
+    let missing: Vec<&str> = fields
+        .iter()
+        .map(String::as_str)
+        .filter(|field| !sources.contains(field))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every concatenated field should derive row_key, missing: {missing:?}"
+    );
+}
+
+#[test]
 fn case_with_aggregate_in_condition() {
     // CASE with aggregate function in WHEN condition
     let sql = r#"
