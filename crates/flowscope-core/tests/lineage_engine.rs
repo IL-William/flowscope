@@ -13012,3 +13012,91 @@ fn a_derived_alias_reused_in_twelve_scopes_crosses_nothing() {
         );
     }
 }
+
+/// Labels of the columns the statement returns, lowercased and sorted.
+fn returned_columns(stmt: &StmtView<'_>) -> Vec<String> {
+    let output_ids: HashSet<&str> = stmt
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == NodeType::Output)
+        .map(|node| &*node.id)
+        .collect();
+    let mut labels: Vec<String> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::Ownership && output_ids.contains(&*edge.from))
+        .filter_map(|edge| stmt.nodes.iter().find(|node| node.id == edge.to))
+        .map(|node| node.label.to_lowercase())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn predicate_schema() -> SchemaMetadata {
+    schema_of(vec![
+        schema_table(None, None, "t", &["k", "x"]),
+        schema_table(None, None, "u", &["k", "y"]),
+    ])
+}
+
+#[test]
+fn a_subquery_a_predicate_reads_returns_nothing() {
+    for sql in [
+        "SELECT k FROM t WHERE x >= (SELECT MAX(y) AS floor_y FROM u)",
+        "SELECT k FROM t WHERE x IN (SELECT y FROM u)",
+        "SELECT k FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k)",
+        "SELECT k FROM t GROUP BY k HAVING MAX(x) > (SELECT MAX(y) FROM u)",
+        "SELECT t.k FROM t JOIN u ON u.k = t.k AND u.y IN (SELECT y FROM u)",
+    ] {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(predicate_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(returned_columns(&stmt), vec!["k"], "{sql}");
+    }
+}
+
+#[test]
+fn a_subquery_a_predicate_reads_keeps_its_lineage_on_its_own_node() {
+    // Inside a CTE, the subquery's column must not join the CTE's columns
+    // either, or the star below would return it.
+    let sql = "WITH c AS (SELECT k FROM t WHERE x IN (SELECT y FROM u)) SELECT * FROM c";
+    let result = run_analysis(sql, Dialect::Snowflake, Some(predicate_schema()));
+    let stmt = first_statement(&result);
+    assert_eq!(returned_columns(&stmt), vec!["k"]);
+    let flows: Vec<String> = flows_into_columns_of(&stmt, "(subquery)")
+        .into_iter()
+        .map(|(column, _)| column)
+        .collect();
+    assert_eq!(flows, vec!["y"]);
+}
+
+#[test]
+fn a_scalar_subquery_in_the_select_list_is_still_returned() {
+    let sql = "SELECT k, (SELECT MAX(y) FROM u) AS m FROM t";
+    let result = run_analysis(sql, Dialect::Snowflake, Some(predicate_schema()));
+    let stmt = first_statement(&result);
+    assert_eq!(returned_columns(&stmt), vec!["k", "m"]);
+}
+
+#[test]
+fn a_derived_table_without_an_alias_is_read_like_one_with_it() {
+    let schema = schema_of(vec![schema_table(None, None, "orders", &["id", "amount"])]);
+    for sql in [
+        "SELECT * FROM (SELECT id, amount FROM orders) WHERE amount > 0",
+        "SELECT * FROM (SELECT id, amount FROM orders) AS o WHERE amount > 0",
+    ] {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(schema.clone()));
+        let stmt = first_statement(&result);
+        assert_eq!(returned_columns(&stmt), vec!["amount", "id"], "{sql}");
+        assert_eq!(
+            base_sources_of(&stmt, "amount"),
+            expected_sources(&["orders.amount"]),
+            "{sql}"
+        );
+        assert!(
+            issue_codes_list(&result).is_empty(),
+            "{sql}: {:?}",
+            issue_codes_list(&result)
+        );
+    }
+}

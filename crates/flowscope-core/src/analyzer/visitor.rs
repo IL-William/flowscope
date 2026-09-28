@@ -21,6 +21,9 @@ use sqlparser::ast::{
 };
 use std::sync::Arc;
 
+/// The name a derived table without an alias is registered under in its scope.
+const UNALIASED_DERIVED_TABLE: &str = "(derived)";
+
 /// A visitor trait for traversing the SQL AST.
 ///
 /// This trait defines default behavior for visiting nodes (traversing children).
@@ -775,11 +778,20 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                 // We create a node for it in the graph, analyze its subquery to determine its
                 // output columns, and then register its alias and columns in the current scope
                 // so the outer query can reference it.
-                let alias_name = alias.as_ref().map(|a| a.name.to_string());
                 let projection_checkpoint = self.ctx.projection_checkpoint();
-                let derived_span = alias_name
+                let derived_span = alias
                     .as_ref()
-                    .and_then(|name| self.locate_derived_alias_span(name));
+                    .and_then(|a| self.locate_derived_alias_span(&a.name.to_string()));
+                // A derived table without an alias, which Snowflake and others
+                // accept, is a relation the outer query reads all the same.
+                // Without a node its projection would hang on whatever the
+                // enclosing select targets, the statement's output at the top, and
+                // the outer select would find no table in scope. It is named so
+                // that no query can qualify a column with it.
+                let alias_name = Some(alias.as_ref().map_or_else(
+                    || UNALIASED_DERIVED_TABLE.to_string(),
+                    |a| a.name.to_string(),
+                ));
 
                 // We model derived tables as CTEs in the graph since they are conceptually
                 // similar: both are ephemeral, named result sets scoped to a single query.

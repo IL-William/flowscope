@@ -144,6 +144,9 @@ pub(crate) struct StatementContext {
     /// a derived table reusing the alias of an earlier one in another scope
     /// gets a node of its own.
     pub(crate) derived_occurrences: HashMap<String, usize>,
+    /// How many subqueries a predicate reads the statement has opened, each
+    /// analysed against a node of its own.
+    pub(crate) predicate_subqueries: usize,
     /// Last join/operation type for edge labeling
     pub(crate) last_operation: Option<String>,
     /// Current join information (type + condition) for edge labeling
@@ -240,6 +243,7 @@ impl StatementContext {
             table_aliases: HashMap::new(),
             subquery_aliases: HashSet::new(),
             derived_occurrences: HashMap::new(),
+            predicate_subqueries: 0,
             last_operation: None,
             current_join_info: JoinInfo::default(),
             table_node_ids: HashMap::new(),
