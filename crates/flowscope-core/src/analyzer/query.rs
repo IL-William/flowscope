@@ -555,7 +555,47 @@ impl<'a> Analyzer<'a> {
         ctx: &mut StatementContext,
         table_qualifier: Option<&str>,
         target_node: Option<&str>,
+        options: &ast::WildcardAdditionalOptions,
     ) {
+        // What `* EXCLUDE (...)` or `* EXCEPT (...)` leaves out, and what
+        // `* RENAME (old AS new)` returns under another name, compared as the
+        // expanded columns' own names are. REPLACE and ILIKE are not read.
+        let mut excluded: HashSet<String> = HashSet::new();
+        match &options.opt_exclude {
+            Some(ast::ExcludeSelectItem::Single(ident)) => {
+                excluded.insert(self.normalize_identifier(&ident.to_string()));
+            }
+            Some(ast::ExcludeSelectItem::Multiple(idents)) => {
+                excluded.extend(
+                    idents
+                        .iter()
+                        .map(|ident| self.normalize_identifier(&ident.to_string())),
+                );
+            }
+            None => {}
+        }
+        if let Some(except) = &options.opt_except {
+            excluded.extend(
+                std::iter::once(&except.first_element)
+                    .chain(&except.additional_elements)
+                    .map(|ident| self.normalize_identifier(&ident.to_string())),
+            );
+        }
+        let renames: Vec<&ast::IdentWithAlias> = match &options.opt_rename {
+            Some(ast::RenameSelectItem::Single(rename)) => vec![rename],
+            Some(ast::RenameSelectItem::Multiple(renames)) => renames.iter().collect(),
+            None => Vec::new(),
+        };
+        let renamed: HashMap<String, String> = renames
+            .into_iter()
+            .map(|rename| {
+                (
+                    self.normalize_identifier(&rename.ident.to_string()),
+                    rename.alias.value.clone(),
+                )
+            })
+            .collect();
+
         // Resolve wildcard sources as (canonical, qualifier) pairs so repeated
         // relation instances in self-joins are expanded independently.
         let tables_to_expand: Vec<(String, String)> = if let Some(qualifier) = table_qualifier {
@@ -615,13 +655,21 @@ impl<'a> Analyzer<'a> {
             if let Some(columns) = columns_to_add {
                 // Expand from schema - NOT approximate.
                 for col_info in columns {
+                    let normalized = self.normalize_identifier(&col_info.name);
+                    if excluded.contains(&normalized) {
+                        continue;
+                    }
+                    let name = renamed
+                        .get(&normalized)
+                        .cloned()
+                        .unwrap_or_else(|| col_info.name.clone());
                     let sources = vec![ColumnRef {
                         table: Some(source_qualifier.clone()),
                         column: col_info.name.clone(),
                     }];
                     self.add_output_column(
                         ctx,
-                        &col_info.name,
+                        &name,
                         sources,
                         None,
                         col_info.data_type,
