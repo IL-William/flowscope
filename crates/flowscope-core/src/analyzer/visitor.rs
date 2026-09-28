@@ -784,12 +784,28 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                 // We model derived tables as CTEs in the graph since they are conceptually
                 // similar: both are ephemeral, named result sets scoped to a single query.
                 // This avoids introducing a separate NodeType for a very similar concept.
+                //
+                // Two derived tables of one statement can share an alias in
+                // different scopes, as `(...) AS v` in two CTEs. Keyed by the alias
+                // alone, the second would find the first's node and its columns
+                // would feed both. The first keeps the plain key, each later one
+                // gets its own.
                 let derived_node_id = alias_name.as_ref().map(|name| {
+                    let occurrence = self
+                        .ctx
+                        .derived_occurrences
+                        .entry(name.clone())
+                        .or_insert(0);
+                    *occurrence += 1;
+                    let key = match *occurrence {
+                        1 => name.clone(),
+                        n => format!("{name}#{n}"),
+                    };
                     self.ctx.add_node(Node {
                         id: generate_statement_scoped_node_id(
                             "derived",
                             self.ctx.statement_index,
-                            name,
+                            &key,
                         ),
                         node_type: NodeType::Cte,
                         label: name.clone().into(),
