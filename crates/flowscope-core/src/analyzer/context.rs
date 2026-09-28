@@ -140,6 +140,10 @@ pub(crate) struct StatementContext {
     pub(crate) table_aliases: HashMap<String, String>,
     /// Subquery aliases (for reference tracking)
     pub(crate) subquery_aliases: HashSet<String>,
+    /// How many derived tables of each alias the statement has opened, so that
+    /// a derived table reusing the alias of an earlier one in another scope
+    /// gets a node of its own.
+    pub(crate) derived_occurrences: HashMap<String, usize>,
     /// Last join/operation type for edge labeling
     pub(crate) last_operation: Option<String>,
     /// Current join information (type + condition) for edge labeling
@@ -235,6 +239,7 @@ impl StatementContext {
             relation_span_cursors: HashMap::new(),
             table_aliases: HashMap::new(),
             subquery_aliases: HashSet::new(),
+            derived_occurrences: HashMap::new(),
             last_operation: None,
             current_join_info: JoinInfo::default(),
             table_node_ids: HashMap::new(),

@@ -12942,3 +12942,73 @@ fn oracle_insert_from_view_with_schema() {
 fn oracle_view_from_view_with_schema() {
     assert_oracle_no_unresolved_with_schema("view_from_view.sql");
 }
+
+#[test]
+fn derived_tables_sharing_an_alias_in_two_ctes_keep_their_own_columns() {
+    // A generated point in time query opens one `(...) AS v` per satellite.
+    let sql = r#"
+        WITH a_intervals AS (
+            SELECT k, ts FROM (SELECT DISTINCT k, ts FROM sat_a) AS v
+        ),
+        b_intervals AS (
+            SELECT k, ts FROM (SELECT DISTINCT k, ts FROM sat_b) AS v
+        )
+        SELECT a.k, a.ts AS a_ts, b.ts AS b_ts
+        FROM a_intervals a
+        JOIN b_intervals b ON a.k = b.k
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "sat_a", &["k", "ts"]),
+        schema_table(None, None, "sat_b", &["k", "ts"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "a_ts"),
+        expected_sources(&["sat_a.ts"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "b_ts"),
+        expected_sources(&["sat_b.ts"])
+    );
+
+    let derived: Vec<&Node> = stmt
+        .nodes
+        .iter()
+        .copied()
+        .filter(|node| node.node_type == NodeType::Cte && &*node.label == "v")
+        .collect();
+    assert_eq!(derived.len(), 2, "one node per derived table");
+    assert_ne!(derived[0].id, derived[1].id);
+}
+
+#[test]
+fn a_derived_alias_reused_in_twelve_scopes_crosses_nothing() {
+    let ctes: Vec<String> = (0..12)
+        .map(|i| format!("c{i} AS (SELECT ts FROM (SELECT DISTINCT ts FROM sat_{i}) AS v)"))
+        .collect();
+    let outputs: Vec<String> = (0..12).map(|i| format!("c{i}.ts AS ts_{i}")).collect();
+    let from: Vec<String> = (0..12).map(|i| format!("c{i}")).collect();
+    let sql = format!(
+        "WITH {} SELECT {} FROM {}",
+        ctes.join(", "),
+        outputs.join(", "),
+        from.join(" CROSS JOIN ")
+    );
+    let schema = schema_of(
+        (0..12)
+            .map(|i| schema_table(None, None, &format!("sat_{i}"), &["ts"]))
+            .collect(),
+    );
+
+    let result = run_analysis(&sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    for i in 0..12 {
+        assert_eq!(
+            base_sources_of(&stmt, &format!("ts_{i}")),
+            expected_sources(&[&format!("sat_{i}.ts")]),
+            "ts_{i}"
+        );
+    }
+}
