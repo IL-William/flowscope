@@ -13100,3 +13100,79 @@ fn a_derived_table_without_an_alias_is_read_like_one_with_it() {
         );
     }
 }
+
+fn star_options_schema() -> SchemaMetadata {
+    schema_of(vec![schema_table(None, None, "p", &["a", "b", "c"])])
+}
+
+#[test]
+fn star_exclude_leaves_the_excluded_columns_out() {
+    for sql in [
+        "SELECT * EXCLUDE (b) FROM p",
+        "SELECT * EXCLUDE b FROM p",
+        "SELECT p.* EXCLUDE (b) FROM p",
+        "WITH c AS (SELECT * EXCLUDE (b) FROM p) SELECT * FROM c",
+    ] {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(star_options_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(returned_columns(&stmt), vec!["a", "c"], "{sql}");
+    }
+}
+
+#[test]
+fn a_column_excluded_and_computed_again_keeps_its_expression() {
+    // With the star copy of b still expanded, the two projections named b
+    // shared one node, the copy came first, and the expression was lost.
+    let sql = "SELECT * EXCLUDE (b), UPPER(b) AS b FROM p";
+    let result = run_analysis(sql, Dialect::Snowflake, Some(star_options_schema()));
+    let stmt = first_statement(&result);
+    assert_eq!(returned_columns(&stmt), vec!["a", "b", "c"]);
+    assert_eq!(base_sources_of(&stmt, "b"), expected_sources(&["p.b"]));
+    let output_b = stmt
+        .nodes
+        .iter()
+        .find(|node| {
+            node.node_type == NodeType::Column
+                && node.label.eq_ignore_ascii_case("b")
+                && stmt.edges.iter().any(|edge| {
+                    edge.edge_type == EdgeType::Ownership
+                        && edge.to == node.id
+                        && stmt.nodes.iter().any(|owner| {
+                            owner.id == edge.from && owner.node_type == NodeType::Output
+                        })
+                })
+        })
+        .expect("b is returned");
+    let expressions: Vec<Option<&str>> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.to == output_b.id && edge.edge_type != EdgeType::Ownership)
+        .map(|edge| edge.expression.as_deref())
+        .collect();
+    assert_eq!(expressions, vec![Some("UPPER(b)")]);
+}
+
+#[test]
+fn star_except_leaves_the_excepted_columns_out() {
+    let sql = "SELECT * EXCEPT (b) FROM p";
+    let result = run_analysis(sql, Dialect::Bigquery, Some(star_options_schema()));
+    let stmt = first_statement(&result);
+    assert_eq!(returned_columns(&stmt), vec!["a", "c"]);
+}
+
+#[test]
+fn star_rename_returns_the_column_under_its_new_name() {
+    for sql in [
+        "SELECT * RENAME (b AS bee) FROM p",
+        "SELECT * RENAME b AS bee FROM p",
+    ] {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(star_options_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(returned_columns(&stmt), vec!["a", "bee", "c"], "{sql}");
+        assert_eq!(
+            base_sources_of(&stmt, "bee"),
+            expected_sources(&["p.b"]),
+            "{sql}"
+        );
+    }
+}
