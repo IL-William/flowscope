@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Walked left-deep chains of binary operators as chains, so that a generated surrogate key over more than about 100 operands keeps every operand in its lineage instead of losing the leftmost ones and reporting `APPROXIMATE_LINEAGE`.
 - Read columns inside TRIM, SUBSTRING, POSITION, CEIL and FLOOR, AT TIME ZONE, IS [NOT] DISTINCT FROM, path and subscript accessors, COLLATE, OVERLAY, SIMILAR TO, RLIKE, ANY and ALL as lineage sources.
+- Read `LATERAL FLATTEN` as a relation with the SEQ, KEY, PATH, INDEX, VALUE and THIS columns, VALUE and THIS derived from its input, instead of as a table named after its alias.
+- Kept two derived tables that share an alias in one statement apart, so that each consumer receives its own derived table's lineage.
+- Kept what a subquery read by a predicate, a join condition or a grouping expression projects out of the statement's outputs, and gave a derived table without an alias a node of its own.
+- Honoured `* EXCLUDE`, `* EXCEPT` and `* RENAME` in wildcard expansion.
 
 ## [0.9.2] - 2026-09-24
 
