@@ -351,7 +351,10 @@ jobs:
       - name: Generate app coverage
         run: yarn workspace @pondpilot/flowscope-app test:coverage
 
+      # Codecov knows the upstream repository only: on a fork the OIDC upload
+      # fails with "Repository not found" after the coverage itself has passed.
       - name: Upload to Codecov
+        if: github.repository == 'pondpilot/flowscope'
         uses: codecov/codecov-action@v5
         with:
           disable_search: true
