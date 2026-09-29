@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Walked left-deep chains of binary operators as chains, so that a generated surrogate key over more than about 100 operands keeps every operand in its lineage instead of losing the leftmost ones and reporting `APPROXIMATE_LINEAGE`.
+- Read columns inside TRIM, SUBSTRING, POSITION, CEIL and FLOOR, AT TIME ZONE, IS [NOT] DISTINCT FROM, path and subscript accessors, COLLATE, OVERLAY, SIMILAR TO, RLIKE, ANY and ALL as lineage sources.
+
 ## [0.9.2] - 2026-09-24
 
 ### Added
