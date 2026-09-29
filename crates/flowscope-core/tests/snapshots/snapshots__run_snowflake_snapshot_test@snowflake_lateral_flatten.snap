@@ -8,10 +8,80 @@ expression: clean_result
       "statementIndex": 0,
       "statementType": "SELECT",
       "joinCount": 1,
-      "complexityScore": 20
+      "complexityScore": 28
     }
   ],
   "nodes": [
+    {
+      "id": "column_1f95f87efeb20682",
+      "type": "column",
+      "label": "KEY",
+      "canonicalName": {
+        "name": "KEY"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "column_268ea64f9e076ed3",
+      "type": "column",
+      "label": "cool_ids",
+      "qualifiedName": "B.cool_ids",
+      "canonicalName": {
+        "schema": "B",
+        "name": "cool_ids"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "column_2f1758652518e9a9",
+      "type": "column",
+      "label": "THIS",
+      "canonicalName": {
+        "name": "THIS"
+      },
+      "statementIds": [
+        0
+      ],
+      "expression": "FLATTEN(input => b.cool_ids)"
+    },
+    {
+      "id": "column_4e2ed24f2245005f",
+      "type": "column",
+      "label": "VALUE",
+      "canonicalName": {
+        "name": "VALUE"
+      },
+      "statementIds": [
+        0
+      ],
+      "expression": "FLATTEN(input => b.cool_ids)"
+    },
+    {
+      "id": "column_7bfb651f3214d1d7",
+      "type": "column",
+      "label": "INDEX",
+      "canonicalName": {
+        "name": "INDEX"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "column_8b8a696c1d07ba23",
+      "type": "column",
+      "label": "PATH",
+      "canonicalName": {
+        "name": "PATH"
+      },
+      "statementIds": [
+        0
+      ]
+    },
     {
       "id": "column_9312b887682fcd76",
       "type": "column",
@@ -24,11 +94,34 @@ expression: clean_result
       ]
     },
     {
+      "id": "column_c2f34f4bce303b03",
+      "type": "column",
+      "label": "SEQ",
+      "canonicalName": {
+        "name": "SEQ"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
       "id": "column_ffa7c99c403f959a",
       "type": "column",
       "label": "NAME",
       "canonicalName": {
         "name": "NAME"
+      },
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "flatten_c1bebf2d8b83f913",
+      "type": "cte",
+      "label": "FLATTEN",
+      "qualifiedName": "FLATTEN",
+      "canonicalName": {
+        "name": "FLATTEN"
       },
       "statementIds": [
         0
@@ -100,10 +193,67 @@ expression: clean_result
   ],
   "edges": [
     {
+      "id": "edge_01f4f9bc314d367e",
+      "from": "flatten_c1bebf2d8b83f913",
+      "to": "column_1f95f87efeb20682",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_09d6cf174d070d13",
+      "from": "flatten_c1bebf2d8b83f913",
+      "to": "column_7bfb651f3214d1d7",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_10b868357df4cc6e",
+      "from": "column_4e2ed24f2245005f",
+      "to": "column_9312b887682fcd76",
+      "type": "data_flow",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_338f68a009f32040",
+      "from": "flatten_c1bebf2d8b83f913",
+      "to": "column_2f1758652518e9a9",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
       "id": "edge_671cdc7a5a898ccd",
       "from": "output_74d22f755ec62dbc",
       "to": "column_ffa7c99c403f959a",
       "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_6a0a97f0ea1ad2ab",
+      "from": "table_14fd3f715fc3ae74",
+      "to": "column_268ea64f9e076ed3",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_7823aeb8ad256f9d",
+      "from": "column_268ea64f9e076ed3",
+      "to": "column_4e2ed24f2245005f",
+      "type": "derivation",
+      "expression": "FLATTEN(input => b.cool_ids)",
+      "joinType": "INNER",
+      "joinCondition": "b.c_id = a.c_id",
       "statementIds": [
         0
       ]
@@ -120,9 +270,48 @@ expression: clean_result
       ]
     },
     {
+      "id": "edge_8ac209680be08157",
+      "from": "flatten_c1bebf2d8b83f913",
+      "to": "column_8b8a696c1d07ba23",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
       "id": "edge_8d1b60030155f6f4",
       "from": "output_74d22f755ec62dbc",
       "to": "column_9312b887682fcd76",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_9c212231bc72c292",
+      "from": "flatten_c1bebf2d8b83f913",
+      "to": "column_c2f34f4bce303b03",
+      "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_a4e289214a89eb54",
+      "from": "column_268ea64f9e076ed3",
+      "to": "column_2f1758652518e9a9",
+      "type": "derivation",
+      "expression": "FLATTEN(input => b.cool_ids)",
+      "joinType": "INNER",
+      "joinCondition": "b.c_id = a.c_id",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_cb4d48c39a8c8c26",
+      "from": "flatten_c1bebf2d8b83f913",
+      "to": "column_4e2ed24f2245005f",
       "type": "ownership",
       "statementIds": [
         0
@@ -135,23 +324,17 @@ expression: clean_result
       "code": "UNRESOLVED_REFERENCE",
       "message": "Column 'name' is ambiguous across tables in scope: A, B",
       "statementIndex": 0
-    },
-    {
-      "severity": "warning",
-      "code": "UNRESOLVED_REFERENCE",
-      "message": "Column 'value' is ambiguous across tables in scope: A, B",
-      "statementIndex": 0
     }
   ],
   "summary": {
     "statementCount": 1,
-    "tableCount": 2,
-    "columnCount": 2,
+    "tableCount": 3,
+    "columnCount": 9,
     "joinCount": 1,
-    "complexityScore": 20,
+    "complexityScore": 28,
     "issueCount": {
       "errors": 0,
-      "warnings": 2,
+      "warnings": 1,
       "infos": 0
     },
     "hasErrors": false
@@ -196,6 +379,10 @@ expression: clean_result
               "table": "A",
               "column": "c_id"
             }
+          },
+          {
+            "name": "cool_ids",
+            "origin": "implied"
           }
         ],
         "origin": "implied",
