@@ -58,6 +58,9 @@ pub(crate) struct Scope {
     /// True when the scope contains a table function relation whose output
     /// columns may be dialect-provided rather than schema-backed.
     pub(crate) has_table_function_relation: bool,
+    /// Node IDs of relations whose columns are all known, such as a FLATTEN.
+    /// An unqualified column missing from them belongs to another relation.
+    pub(crate) fixed_column_relations: HashSet<Arc<str>>,
 }
 
 impl Scope {
@@ -137,6 +140,13 @@ pub(crate) struct StatementContext {
     pub(crate) table_aliases: HashMap<String, String>,
     /// Subquery aliases (for reference tracking)
     pub(crate) subquery_aliases: HashSet<String>,
+    /// How many derived tables of each alias the statement has opened, so that
+    /// a derived table reusing the alias of an earlier one in another scope
+    /// gets a node of its own.
+    pub(crate) derived_occurrences: HashMap<String, usize>,
+    /// How many subqueries a predicate reads the statement has opened, each
+    /// analysed against a node of its own.
+    pub(crate) predicate_subqueries: usize,
     /// Last join/operation type for edge labeling
     pub(crate) last_operation: Option<String>,
     /// Current join information (type + condition) for edge labeling
@@ -232,6 +242,8 @@ impl StatementContext {
             relation_span_cursors: HashMap::new(),
             table_aliases: HashMap::new(),
             subquery_aliases: HashSet::new(),
+            derived_occurrences: HashMap::new(),
+            predicate_subqueries: 0,
             last_operation: None,
             current_join_info: JoinInfo::default(),
             table_node_ids: HashMap::new(),
@@ -674,6 +686,26 @@ impl StatementContext {
     pub(crate) fn current_scope_has_table_function_relation(&self) -> bool {
         self.current_scope()
             .is_some_and(|scope| scope.has_table_function_relation)
+    }
+
+    /// Mark a relation of the current scope as having no columns beyond those
+    /// registered for it.
+    pub(crate) fn mark_fixed_columns_in_scope(&mut self, node_id: Arc<str>) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.fixed_column_relations.insert(node_id);
+        }
+    }
+
+    /// Relation instances of the current scope that may have a column missing
+    /// from every known column list, that is all but those with fixed columns.
+    pub(crate) fn open_relation_instances_in_current_scope(&self) -> Vec<RelationInstance> {
+        let Some(scope) = self.current_scope() else {
+            return Vec::new();
+        };
+        self.relation_instances_in_current_scope()
+            .into_iter()
+            .filter(|instance| !scope.fixed_column_relations.contains(&instance.node_id))
+            .collect()
     }
 
     /// Register statement-global output columns for a named CTE definition.
