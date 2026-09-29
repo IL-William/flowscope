@@ -555,7 +555,47 @@ impl<'a> Analyzer<'a> {
         ctx: &mut StatementContext,
         table_qualifier: Option<&str>,
         target_node: Option<&str>,
+        options: &ast::WildcardAdditionalOptions,
     ) {
+        // What `* EXCLUDE (...)` or `* EXCEPT (...)` leaves out, and what
+        // `* RENAME (old AS new)` returns under another name, compared as the
+        // expanded columns' own names are. REPLACE and ILIKE are not read.
+        let mut excluded: HashSet<String> = HashSet::new();
+        match &options.opt_exclude {
+            Some(ast::ExcludeSelectItem::Single(ident)) => {
+                excluded.insert(self.normalize_identifier(&ident.to_string()));
+            }
+            Some(ast::ExcludeSelectItem::Multiple(idents)) => {
+                excluded.extend(
+                    idents
+                        .iter()
+                        .map(|ident| self.normalize_identifier(&ident.to_string())),
+                );
+            }
+            None => {}
+        }
+        if let Some(except) = &options.opt_except {
+            excluded.extend(
+                std::iter::once(&except.first_element)
+                    .chain(&except.additional_elements)
+                    .map(|ident| self.normalize_identifier(&ident.to_string())),
+            );
+        }
+        let renames: Vec<&ast::IdentWithAlias> = match &options.opt_rename {
+            Some(ast::RenameSelectItem::Single(rename)) => vec![rename],
+            Some(ast::RenameSelectItem::Multiple(renames)) => renames.iter().collect(),
+            None => Vec::new(),
+        };
+        let renamed: HashMap<String, String> = renames
+            .into_iter()
+            .map(|rename| {
+                (
+                    self.normalize_identifier(&rename.ident.to_string()),
+                    rename.alias.value.clone(),
+                )
+            })
+            .collect();
+
         // Resolve wildcard sources as (canonical, qualifier) pairs so repeated
         // relation instances in self-joins are expanded independently.
         let tables_to_expand: Vec<(String, String)> = if let Some(qualifier) = table_qualifier {
@@ -615,13 +655,21 @@ impl<'a> Analyzer<'a> {
             if let Some(columns) = columns_to_add {
                 // Expand from schema - NOT approximate.
                 for col_info in columns {
+                    let normalized = self.normalize_identifier(&col_info.name);
+                    if excluded.contains(&normalized) {
+                        continue;
+                    }
+                    let name = renamed
+                        .get(&normalized)
+                        .cloned()
+                        .unwrap_or_else(|| col_info.name.clone());
                     let sources = vec![ColumnRef {
                         table: Some(source_qualifier.clone()),
                         column: col_info.name.clone(),
                     }];
                     self.add_output_column(
                         ctx,
-                        &col_info.name,
+                        &name,
                         sources,
                         None,
                         col_info.data_type,
@@ -865,13 +913,20 @@ impl<'a> Analyzer<'a> {
                 }
             }
             0 => {
-                // No candidates found - if there's only one relation instance in scope, use it
-                // (the column might exist but not be in our schema)
-                if relation_instances.len() == 1 {
-                    return Some(relation_instances[0].canonical.clone());
+                // No candidates found - if only one relation instance in scope may have
+                // columns we do not know of, use it (the column might exist but not be in
+                // our schema). A FLATTEN has none, so it cannot own the column.
+                let owners = ctx.open_relation_instances_in_current_scope();
+                if owners.len() == 1 {
+                    return Some(owners[0].canonical.clone());
                 }
                 // Multiple tables but column not found in any - ambiguous
-                let mut sorted_tables: Vec<_> = relation_instances
+                let listed = if owners.is_empty() {
+                    &relation_instances
+                } else {
+                    &owners
+                };
+                let mut sorted_tables: Vec<_> = listed
                     .iter()
                     .map(|instance| instance.canonical.clone())
                     .collect();
@@ -1208,6 +1263,40 @@ impl<'a> Analyzer<'a> {
         ctx.output_columns.push(OutputColumn {
             name: normalized_name,
             data_type: params.data_type,
+            node_id,
+        });
+    }
+
+    /// Adds a column that `target_node` produces without reading any column,
+    /// such as the position of an element in a flattened array.
+    ///
+    /// Unlike a source-less projection, the column is not attributed to the
+    /// relations in scope: it describes the relation that owns it.
+    pub(super) fn add_unsourced_column(
+        &mut self,
+        ctx: &mut StatementContext,
+        name: &str,
+        target_node: &Arc<str>,
+    ) {
+        let normalized_name = self.normalize_identifier(name);
+        let node_id = generate_column_node_id(Some(target_node), &normalized_name);
+        ctx.add_node(Node {
+            id: node_id.clone(),
+            node_type: NodeType::Column,
+            label: normalized_name.clone().into(),
+            ..Default::default()
+        });
+        let edge_id = generate_edge_id(target_node, &node_id);
+        if !ctx.edge_ids.contains(&edge_id) {
+            ctx.add_edge(Edge::ownership(
+                edge_id,
+                target_node.clone(),
+                node_id.clone(),
+            ));
+        }
+        ctx.output_columns.push(OutputColumn {
+            name: normalized_name,
+            data_type: None,
             node_id,
         });
     }

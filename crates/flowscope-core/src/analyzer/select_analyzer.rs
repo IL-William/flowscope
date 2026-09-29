@@ -230,7 +230,7 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                         },
                     );
                 }
-                SelectItem::QualifiedWildcard(name, _) => {
+                SelectItem::QualifiedWildcard(name, options) => {
                     let qualifier = name.to_string();
                     // SelectItemQualifiedWildcardKind::Display appends ".*"
                     let qualifier = qualifier.strip_suffix(".*").unwrap_or(&qualifier);
@@ -238,11 +238,16 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                         self.ctx,
                         Some(qualifier),
                         self.target_node.as_deref(),
+                        options,
                     );
                 }
-                SelectItem::Wildcard(_) => {
-                    self.analyzer
-                        .expand_wildcard(self.ctx, None, self.target_node.as_deref());
+                SelectItem::Wildcard(options) => {
+                    self.analyzer.expand_wildcard(
+                        self.ctx,
+                        None,
+                        self.target_node.as_deref(),
+                        options,
+                    );
                 }
             }
         }

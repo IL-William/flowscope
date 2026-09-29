@@ -13,16 +13,20 @@
 
 use super::context::{ColumnRef, StatementContext};
 use super::functions;
-use super::helpers::check_expr_types;
+use super::helpers::{check_expr_types, generate_statement_scoped_node_id};
 use super::Analyzer;
 use crate::generated;
-use crate::types::{AggregationInfo, FilterClauseType};
+use crate::types::{AggregationInfo, FilterClauseType, Node, NodeType};
 use crate::Dialect;
 use sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr};
 use std::collections::HashSet;
 use std::sync::Arc;
 #[cfg(feature = "tracing")]
 use tracing::debug;
+
+/// The label of the node a subquery read by a predicate is analyzed against. A
+/// query cannot write it, so nothing can qualify a column with it.
+const PREDICATE_SUBQUERY: &str = "(subquery)";
 
 /// Maximum recursion depth for expression traversal to prevent stack overflow
 /// on maliciously crafted or deeply nested SQL expressions.
@@ -135,6 +139,29 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
         }
     }
 
+    /// Analyzes a subquery an expression other than a projection reads: a
+    /// predicate compares with it or tests it for rows, and a join condition or
+    /// a grouping expression reads it the same way. What it projects is never
+    /// returned, so it is analyzed against a node of its own, labelled
+    /// `(subquery)`, and its columns are taken back once it has been read.
+    /// Analyzed with no target, they would hang on whatever the enclosing
+    /// select targets, the statement's output at the top, as if the query
+    /// returned them, and would join the column list of an enclosing CTE.
+    fn analyze_predicate_subquery(&mut self, query: &ast::Query) {
+        let checkpoint = self.ctx.projection_checkpoint();
+        self.ctx.predicate_subqueries += 1;
+        let key = format!("{PREDICATE_SUBQUERY}#{}", self.ctx.predicate_subqueries);
+        let node_id = self.ctx.add_node(Node {
+            id: generate_statement_scoped_node_id("subquery", self.ctx.statement_index, &key),
+            node_type: NodeType::Cte,
+            label: PREDICATE_SUBQUERY.into(),
+            qualified_name: Some(PREDICATE_SUBQUERY.into()),
+            ..Default::default()
+        });
+        self.analyzer.analyze_query(self.ctx, query, Some(&node_id));
+        self.ctx.take_output_columns_since(checkpoint);
+    }
+
     /// Recursively visits an expression to find and analyze subqueries.
     ///
     /// The `depth` parameter tracks recursion depth to prevent stack overflow
@@ -153,11 +180,9 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
         let next_depth = depth + 1;
 
         match expr {
-            Expr::Subquery(query) => self.analyzer.analyze_query(self.ctx, query, None),
-            Expr::InSubquery { subquery, .. } => {
-                self.analyzer.analyze_query(self.ctx, subquery, None)
-            }
-            Expr::Exists { subquery, .. } => self.analyzer.analyze_query(self.ctx, subquery, None),
+            Expr::Subquery(query) => self.analyze_predicate_subquery(query),
+            Expr::InSubquery { subquery, .. } => self.analyze_predicate_subquery(subquery),
+            Expr::Exists { subquery, .. } => self.analyze_predicate_subquery(subquery),
             Expr::BinaryOp { .. } => {
                 for operand in binary_op_operands(expr) {
                     self.visit_expression_for_subqueries(operand, next_depth);
