@@ -21,7 +21,8 @@ expression: clean_result
       },
       "statementIds": [
         0
-      ]
+      ],
+      "expression": "FLATTEN(input => b.cool_ids)"
     },
     {
       "id": "column_268ea64f9e076ed3",
@@ -80,7 +81,8 @@ expression: clean_result
       },
       "statementIds": [
         0
-      ]
+      ],
+      "expression": "FLATTEN(input => b.cool_ids)"
     },
     {
       "id": "column_9312b887682fcd76",
@@ -300,6 +302,30 @@ expression: clean_result
       "id": "edge_a4e289214a89eb54",
       "from": "column_268ea64f9e076ed3",
       "to": "column_2f1758652518e9a9",
+      "type": "derivation",
+      "expression": "FLATTEN(input => b.cool_ids)",
+      "joinType": "INNER",
+      "joinCondition": "b.c_id = a.c_id",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_b92c790c00e1761f",
+      "from": "column_268ea64f9e076ed3",
+      "to": "column_8b8a696c1d07ba23",
+      "type": "derivation",
+      "expression": "FLATTEN(input => b.cool_ids)",
+      "joinType": "INNER",
+      "joinCondition": "b.c_id = a.c_id",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_bc9ac2bfeded5339",
+      "from": "column_268ea64f9e076ed3",
+      "to": "column_1f95f87efeb20682",
       "type": "derivation",
       "expression": "FLATTEN(input => b.cool_ids)",
       "joinType": "INNER",

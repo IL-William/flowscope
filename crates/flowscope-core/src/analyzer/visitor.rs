@@ -472,9 +472,10 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
     /// Registers Snowflake's `LATERAL FLATTEN(INPUT => expr) AS f` as a
     /// relation with the columns FLATTEN returns, so that `f.value` resolves.
     ///
-    /// VALUE and THIS carry the input, so they derive from the columns it
-    /// reads, with the whole call as their expression. SEQ, KEY, PATH and
-    /// INDEX say where an element sits rather than carry it, and read nothing.
+    /// VALUE and THIS carry the input, and KEY and PATH name where an element
+    /// sits in it, which for an object is part of its content: all four derive
+    /// from the columns it reads, with the whole call as their expression. SEQ
+    /// and INDEX number the rows and the elements, and read nothing.
     fn visit_flatten(
         &mut self,
         name: &ast::ObjectName,
@@ -530,8 +531,9 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
         );
 
         let checkpoint = self.ctx.projection_checkpoint();
+        let mut first_carrier = true;
         for column in ["SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"] {
-            let carries_input = matches!(column, "VALUE" | "THIS");
+            let carries_input = matches!(column, "KEY" | "PATH" | "VALUE" | "THIS");
             if carries_input && !sources.is_empty() {
                 let reported = self.analyzer.issues.len();
                 self.analyzer.add_output_column_with_aggregation(
@@ -546,11 +548,12 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
                         aggregation: None,
                     },
                 );
-                // THIS reads the input VALUE has just read, so whatever resolving
-                // it reports has been reported once already.
-                if column == "THIS" {
+                // Each reads the input the first one has just read, so whatever
+                // resolving it reports has been reported once already.
+                if !first_carrier {
                     self.analyzer.issues.truncate(reported);
                 }
+                first_carrier = false;
             } else {
                 self.analyzer
                     .add_unsourced_column(self.ctx, column, &node_id);
