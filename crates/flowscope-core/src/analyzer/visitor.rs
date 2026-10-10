@@ -4,7 +4,7 @@
 //! and building lineage graphs. It separates traversal logic (the `Visitor` trait)
 //! from analysis logic (the `LineageVisitor` implementation).
 
-use super::context::StatementContext;
+use super::context::{OutputColumn, StatementContext};
 use super::expression::ExpressionAnalyzer;
 use super::helpers::{
     alias_visibility_warning, find_cte_body_span, find_cte_definition_span,
@@ -622,10 +622,28 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
 
 impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
     fn visit_query(&mut self, query: &Query) {
+        // A name this WITH defines hides, until the query ends, the CTE an
+        // enclosing or earlier WITH gave it: its node and its columns, put back
+        // on the way out. Keyed by the name alone, the second definition would
+        // take the first's node and overwrite its columns, and every reader of
+        // either would get both lineages.
+        let mut hidden: Vec<(String, Arc<str>, Option<Vec<OutputColumn>>)> = Vec::new();
         if let Some(with) = &query.with {
             let mut cte_ids: Vec<(String, Arc<str>)> = Vec::new();
             for cte in &with.cte_tables {
                 let cte_name = cte.alias.name.to_string();
+                let occurrence = self
+                    .ctx
+                    .cte_occurrences
+                    .entry(cte_name.clone())
+                    .or_insert(0);
+                *occurrence += 1;
+                // The first keeps the key it always had, so a statement that
+                // never repeats a name is analysed as before.
+                let key = match *occurrence {
+                    1 => cte_name.clone(),
+                    n => format!("{cte_name}#{n}"),
+                };
                 let cte_span = self.locate_cte_definition_span(&cte_name);
                 let body_span = cte_span.and_then(|span| {
                     let sql = if let Some(source) = &self.analyzer.current_statement_source {
@@ -636,11 +654,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     find_cte_body_span(sql, span)
                 });
                 let cte_id = self.ctx.add_node(Node {
-                    id: generate_statement_scoped_node_id(
-                        "cte",
-                        self.ctx.statement_index,
-                        &cte_name,
-                    ),
+                    id: generate_statement_scoped_node_id("cte", self.ctx.statement_index, &key),
                     node_type: NodeType::Cte,
                     label: cte_name.clone().into(),
                     qualified_name: Some(cte_name.clone().into()),
@@ -654,9 +668,16 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     *cursor = (*cursor).max(span.end);
                 }
 
-                self.ctx
+                if let Some(previous) = self
+                    .ctx
                     .cte_definitions
-                    .insert(cte_name.clone(), cte_id.clone());
+                    .insert(cte_name.clone(), cte_id.clone())
+                {
+                    if previous != cte_id {
+                        let columns = self.ctx.aliased_subquery_columns.remove(&cte_name);
+                        hidden.push((cte_name.clone(), previous, columns));
+                    }
+                }
                 self.ctx
                     .cte_node_to_name
                     .insert(cte_id.clone(), cte_name.clone());
@@ -679,6 +700,18 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
         // Analyze ORDER BY for alias visibility warnings
         if let Some(order_by) = &query.order_by {
             self.analyze_order_by(order_by);
+        }
+
+        for (name, previous, columns) in hidden.into_iter().rev() {
+            self.ctx.cte_definitions.insert(name.clone(), previous);
+            match columns {
+                Some(columns) => {
+                    self.ctx.aliased_subquery_columns.insert(name, columns);
+                }
+                None => {
+                    self.ctx.aliased_subquery_columns.remove(&name);
+                }
+            }
         }
     }
 
