@@ -9939,6 +9939,8 @@ fn flatten_value_comes_from_its_input_not_from_a_namesake() {
     assert_eq!(
         expressions,
         HashSet::from([
+            ("key", Some("FLATTEN(input => o.tags)")),
+            ("path", Some("FLATTEN(input => o.tags)")),
             ("value", Some("FLATTEN(input => o.tags)")),
             ("this", Some("FLATTEN(input => o.tags)")),
         ])
@@ -10029,7 +10031,32 @@ fn flatten_position_columns_read_nothing() {
         .into_iter()
         .map(|(column, _)| column)
         .collect();
-    assert_eq!(fed, expected_sources(&["value", "this"]));
+    assert_eq!(fed, expected_sources(&["key", "path", "value", "this"]));
+}
+
+#[test]
+fn flatten_key_and_path_come_from_the_input() {
+    // An object's keys are its content: flattening parsed JSON, the key and
+    // the path are read from the column the JSON is in. The index numbers the
+    // elements and reads nothing.
+    let sql = r#"
+        SELECT h.id, f.key AS element_name, f.path AS element_path,
+            f.value::STRING AS element_value, f.index AS position
+        FROM hx h,
+        LATERAL FLATTEN(input => TRY_PARSE_JSON(h.data)) f
+    "#;
+    let schema = schema_of(vec![schema_table(None, None, "hx", &["id", "data"])]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    for output in ["element_name", "element_path", "element_value"] {
+        assert_eq!(
+            base_sources_of(&stmt, output),
+            expected_sources(&["hx.data"]),
+            "{output}"
+        );
+    }
+    assert!(base_sources_of(&stmt, "position").is_empty());
 }
 
 #[test]
@@ -10104,14 +10131,14 @@ fn star_over_flatten_returns_its_columns() {
         columns,
         expected_sources(&["id", "arr", "seq", "key", "path", "index", "value", "this"])
     );
-    for carried in ["value", "this"] {
+    for carried in ["key", "path", "value", "this"] {
         assert_eq!(
             base_sources_of(&stmt, carried),
             expected_sources(&["items.arr"]),
             "sources of {carried}"
         );
     }
-    for position in ["seq", "key", "path", "index"] {
+    for position in ["seq", "index"] {
         assert!(
             base_sources_of(&stmt, position).is_empty(),
             "{position} should read nothing"
