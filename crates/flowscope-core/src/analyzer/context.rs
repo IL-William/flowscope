@@ -14,10 +14,14 @@ pub(crate) const DBT_MODEL_SINK_METADATA_KEY: &str = "dbtModelSink";
 pub(crate) struct PendingWildcard {
     /// The source canonical name (table or CTE) with unknown columns
     pub(crate) source_canonical: String,
-    /// The target entity (CTE name or derived table alias) receiving the wildcard
-    pub(crate) target_name: String,
     /// Node ID of the source
     pub(crate) source_node_id: Arc<str>,
+    /// Node ID of the target. Two CTEs of one name in nested `WITH` blocks
+    /// share `target_name` and nothing else.
+    pub(crate) target_node_id: Arc<str>,
+    /// The node whose own wildcards feed the source: the CTE definition the
+    /// source names, else the source itself.
+    pub(crate) upstream_node_id: Arc<str>,
 }
 
 /// A single table/view reference in a FROM or JOIN clause.
@@ -144,6 +148,9 @@ pub(crate) struct StatementContext {
     /// a derived table reusing the alias of an earlier one in another scope
     /// gets a node of its own.
     pub(crate) derived_occurrences: HashMap<String, usize>,
+    /// How many CTEs of each name the statement has defined, so that a nested
+    /// `WITH` defining a name an earlier CTE has gets a node of its own.
+    pub(crate) cte_occurrences: HashMap<String, usize>,
     /// How many subqueries a predicate reads the statement has opened, each
     /// analysed against a node of its own.
     pub(crate) predicate_subqueries: usize,
@@ -243,6 +250,7 @@ impl StatementContext {
             table_aliases: HashMap::new(),
             subquery_aliases: HashSet::new(),
             derived_occurrences: HashMap::new(),
+            cte_occurrences: HashMap::new(),
             predicate_subqueries: 0,
             last_operation: None,
             current_join_info: JoinInfo::default(),
