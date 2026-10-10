@@ -13176,3 +13176,224 @@ fn star_rename_returns_the_column_under_its_new_name() {
         );
     }
 }
+
+#[test]
+fn ctes_sharing_a_name_in_two_nested_withs_keep_their_own_columns() {
+    // dbt inlines each ephemeral model as a CTE holding its own WITH, and two
+    // of them often name an inner CTE alike.
+    let sql = r#"
+        WITH a AS (
+            WITH final AS (SELECT k, ts FROM sat_a) SELECT k, ts FROM final
+        ),
+        b AS (
+            WITH final AS (SELECT k, ts FROM sat_b) SELECT k, ts FROM final
+        )
+        SELECT a.k, a.ts AS a_ts, b.ts AS b_ts
+        FROM a
+        JOIN b ON a.k = b.k
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "sat_a", &["k", "ts"]),
+        schema_table(None, None, "sat_b", &["k", "ts"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "a_ts"),
+        expected_sources(&["sat_a.ts"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "b_ts"),
+        expected_sources(&["sat_b.ts"])
+    );
+}
+
+#[test]
+fn ctes_sharing_a_name_in_two_derived_tables_keep_their_own_columns() {
+    let sql = r#"
+        SELECT p.ts AS paid_ts, q.ts AS open_ts
+        FROM (WITH z AS (SELECT ts FROM payments) SELECT ts FROM z) AS p
+        CROSS JOIN (WITH z AS (SELECT ts FROM invoices) SELECT ts FROM z) AS q
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "payments", &["ts"]),
+        schema_table(None, None, "invoices", &["ts"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "paid_ts"),
+        expected_sources(&["payments.ts"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "open_ts"),
+        expected_sources(&["invoices.ts"])
+    );
+}
+
+#[test]
+fn a_cte_shadowed_in_a_nested_with_is_still_itself_outside_it() {
+    let sql = r#"
+        WITH final AS (SELECT ts FROM sat_a),
+        inner_q AS (
+            WITH final AS (SELECT ts FROM sat_b) SELECT ts FROM final
+        )
+        SELECT final.ts AS outer_ts, inner_q.ts AS inner_ts
+        FROM final
+        CROSS JOIN inner_q
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "sat_a", &["ts"]),
+        schema_table(None, None, "sat_b", &["ts"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "outer_ts"),
+        expected_sources(&["sat_a.ts"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "inner_ts"),
+        expected_sources(&["sat_b.ts"])
+    );
+}
+
+#[test]
+fn ctes_sharing_a_name_expand_their_own_stars() {
+    let sql = r#"
+        WITH a AS (
+            WITH final AS (SELECT k, ts FROM sat_a) SELECT * FROM final
+        ),
+        b AS (
+            WITH final AS (SELECT k, amount FROM sat_b) SELECT * FROM final
+        )
+        SELECT a.ts AS a_ts, b.amount AS b_amount
+        FROM a
+        JOIN b ON a.k = b.k
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "sat_a", &["k", "ts"]),
+        schema_table(None, None, "sat_b", &["k", "amount"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "a_ts"),
+        expected_sources(&["sat_a.ts"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "b_amount"),
+        expected_sources(&["sat_b.amount"])
+    );
+}
+
+#[test]
+fn ctes_sharing_a_name_infer_their_own_columns_without_a_schema() {
+    let sql = r#"
+        WITH a AS (
+            WITH final AS (SELECT * FROM sat_a) SELECT * FROM final
+        ),
+        b AS (
+            WITH final AS (SELECT * FROM sat_b) SELECT * FROM final
+        )
+        SELECT a.ts AS a_ts, b.amount AS b_amount
+        FROM a
+        CROSS JOIN b
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "a_ts"),
+        expected_sources(&["sat_a.ts"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "b_amount"),
+        expected_sources(&["sat_b.amount"])
+    );
+}
+
+#[test]
+fn a_filter_on_one_of_two_ctes_sharing_a_name_stays_on_it() {
+    let sql = r#"
+        WITH a AS (
+            WITH final AS (SELECT k, ts FROM sat_a) SELECT k, ts FROM final
+        ),
+        b AS (
+            WITH final AS (SELECT k, ts FROM sat_b) SELECT k, ts FROM final WHERE final.k = 1
+        )
+        SELECT a.ts AS a_ts, b.ts AS b_ts
+        FROM a
+        JOIN b ON a.k = b.k
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "sat_a", &["k", "ts"]),
+        schema_table(None, None, "sat_b", &["k", "ts"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    let finals: Vec<&Node> = stmt
+        .nodes
+        .iter()
+        .copied()
+        .filter(|node| node.node_type == NodeType::Cte && &*node.label == "final")
+        .collect();
+    assert_eq!(finals.len(), 2, "one node per CTE");
+    let filtered: Vec<usize> = finals.iter().map(|node| node.filters.len()).collect();
+    assert_eq!(
+        filtered.iter().filter(|n| **n > 0).count(),
+        1,
+        "only the filtered one carries the predicate: {filtered:?}"
+    );
+}
+
+#[test]
+fn an_unqualified_column_of_an_outer_cte_is_not_read_from_an_inner_namesake() {
+    let sql = r#"
+        WITH final AS (SELECT ts FROM sat_a)
+        SELECT ts AS outer_ts, d.amount AS inner_amount
+        FROM final
+        CROSS JOIN (WITH final AS (SELECT amount FROM sat_b) SELECT amount FROM final) AS d
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "sat_a", &["ts"]),
+        schema_table(None, None, "sat_b", &["amount"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "outer_ts"),
+        expected_sources(&["sat_a.ts"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "inner_amount"),
+        expected_sources(&["sat_b.amount"])
+    );
+}
+
+#[test]
+fn an_outer_cte_named_like_an_inlined_model_s_inner_one_reads_through_it() {
+    // dbt inlines an ephemeral model holding its own `final`, and the model
+    // reading it names its last CTE `final` too.
+    let sql = r#"
+        WITH __dbt__cte__a AS (
+            WITH final AS (SELECT k, ts FROM t) SELECT * FROM final
+        ),
+        final AS (SELECT * FROM __dbt__cte__a)
+        SELECT ts AS out_ts FROM final
+    "#;
+    let schema = schema_of(vec![schema_table(None, None, "t", &["k", "ts"])]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "out_ts"),
+        expected_sources(&["t.ts"])
+    );
+}
