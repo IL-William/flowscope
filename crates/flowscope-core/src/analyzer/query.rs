@@ -1001,7 +1001,17 @@ impl<'a> Analyzer<'a> {
         ctx: &mut StatementContext,
         params: OutputColumnParams,
     ) {
-        let normalized_name = self.normalize_identifier(&params.name);
+        // A later branch of a set operation names no column: each takes the
+        // first branch's name at its position.
+        let name = match ctx.branch_names.as_mut() {
+            Some(branch) if branch.target == params.target_node => {
+                let at = branch.next;
+                branch.next += 1;
+                branch.names.get(at).cloned()
+            }
+            _ => None,
+        };
+        let normalized_name = self.normalize_identifier(name.as_deref().unwrap_or(&params.name));
         let node_id = generate_column_node_id(params.target_node.as_deref(), &normalized_name);
         let ownership_edge_id = params
             .target_node

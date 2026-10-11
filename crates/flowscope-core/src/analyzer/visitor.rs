@@ -4,11 +4,11 @@
 //! and building lineage graphs. It separates traversal logic (the `Visitor` trait)
 //! from analysis logic (the `LineageVisitor` implementation).
 
-use super::context::{OutputColumn, StatementContext};
+use super::context::{BranchNames, OutputColumn, StatementContext};
 use super::expression::ExpressionAnalyzer;
 use super::helpers::{
     alias_visibility_warning, find_cte_body_span, find_cte_definition_span,
-    find_derived_table_alias_span, generate_statement_scoped_node_id,
+    find_derived_table_alias_span, generate_column_node_id, generate_statement_scoped_node_id,
 };
 use super::query::OutputColumnParams;
 use super::select_analyzer::SelectAnalyzer;
@@ -16,8 +16,8 @@ use super::Analyzer;
 use crate::generated::is_value_table_function;
 use crate::types::{issue_codes, Issue, Node, NodeType, Span};
 use sqlparser::ast::{
-    self, CreateView, Cte, Expr, Ident, Join, Query, Select, SetExpr, SetOperator, Statement,
-    TableAlias, TableFactor, TableWithJoins, Values,
+    self, CreateView, Cte, Expr, Ident, Join, Query, Select, SetExpr, SetOperator, SetQuantifier,
+    Statement, TableAlias, TableFactor, TableWithJoins, Values,
 };
 use std::sync::Arc;
 
@@ -723,7 +723,10 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
             SetExpr::Select(select) => self.visit_select(select),
             SetExpr::Query(query) => self.visit_query(query),
             SetExpr::SetOperation {
-                op, left, right, ..
+                op,
+                set_quantifier,
+                left,
+                right,
             } => {
                 let op_name = match op {
                     SetOperator::Union => "UNION",
@@ -731,8 +734,40 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     SetOperator::Except => "EXCEPT",
                     SetOperator::Minus => "MINUS",
                 };
+                let sink = self.ctx.sink_node_id().map(|id| id.to_string());
+                let target = self.target_node.clone().or(sink);
+                let checkpoint = self.ctx.output_columns.len();
+                self.ctx.last_branch_names = None;
                 self.visit_set_expr(left);
+                // The first branch's names: a nested set operation's own first
+                // branch's, or the columns the branch just gave the target.
+                let names = match self.ctx.last_branch_names.take() {
+                    Some((of, names)) if of == target => names,
+                    _ => self.ctx.output_columns[checkpoint..]
+                        .iter()
+                        .filter(|c| {
+                            generate_column_node_id(target.as_deref(), &c.name) == c.node_id
+                        })
+                        .map(|c| c.name.clone())
+                        .collect(),
+                };
+                let by_name = matches!(
+                    set_quantifier,
+                    SetQuantifier::ByName
+                        | SetQuantifier::AllByName
+                        | SetQuantifier::DistinctByName
+                );
+                let outer = std::mem::replace(
+                    &mut self.ctx.branch_names,
+                    (!by_name).then(|| BranchNames {
+                        target: target.clone(),
+                        names: names.clone(),
+                        next: 0,
+                    }),
+                );
                 self.visit_set_expr(right);
+                self.ctx.branch_names = outer;
+                self.ctx.last_branch_names = Some((target, names));
                 if self.target_node.is_some() {
                     self.ctx.last_operation = Some(op_name.to_string());
                 }
