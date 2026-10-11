@@ -13550,3 +13550,64 @@ fn a_derived_table_inside_a_later_branch_keeps_its_own_names() {
         expected_sources(&["t1.k", "t2.k"])
     );
 }
+
+#[test]
+fn star_ilike_keeps_the_columns_its_pattern_matches() {
+    for (sql, want) in [
+        ("SELECT * ILIKE 'a%' FROM p", vec!["a"]),
+        ("SELECT * ILIKE '%B' FROM p", vec!["b"]),
+        ("SELECT * ILIKE '_' FROM p", vec!["a", "b", "c"]),
+        ("SELECT p.* ILIKE '%c%' FROM p", vec!["c"]),
+        (
+            "WITH c AS (SELECT * ILIKE 'C' FROM p) SELECT * FROM c",
+            vec!["c"],
+        ),
+        (
+            "WITH c AS (SELECT * ILIKE '%' FROM p) SELECT * FROM c",
+            vec!["a", "b", "c"],
+        ),
+    ] {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(star_options_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(returned_columns(&stmt), want, "{sql}");
+    }
+}
+
+#[test]
+fn star_replace_computes_the_column_it_replaces() {
+    // The replacing expression stands where the column was, keeps its place
+    // and name, and reads what it reads.
+    for (sql, sources) in [
+        ("SELECT * REPLACE (UPPER(b) AS b) FROM p", vec!["p.b"]),
+        (
+            "SELECT p.* REPLACE (b || c AS b) FROM p",
+            vec!["p.b", "p.c"],
+        ),
+        (
+            "WITH r AS (SELECT * REPLACE (a + 1 AS a) FROM p) SELECT * FROM r",
+            vec!["p.a"],
+        ),
+    ] {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(star_options_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(returned_columns(&stmt), vec!["a", "b", "c"], "{sql}");
+        let replaced = if sql.contains("a + 1") { "a" } else { "b" };
+        assert_eq!(
+            base_sources_of(&stmt, replaced),
+            expected_sources(&sources),
+            "{sql}"
+        );
+        let expressions: Vec<bool> = stmt
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.node_type == NodeType::Column && node.label.eq_ignore_ascii_case(replaced)
+            })
+            .map(|node| node.expression.is_some())
+            .collect();
+        assert!(
+            expressions.contains(&true),
+            "{sql}: the replaced column carries its expression"
+        );
+    }
+}
