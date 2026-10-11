@@ -7,6 +7,7 @@
 use super::context::{
     ColumnRef, OutputColumn, PendingWildcard, StatementContext, DBT_MODEL_SINK_METADATA_KEY,
 };
+use super::expression::ExpressionAnalyzer;
 use super::helpers::{
     generate_column_node_id, generate_edge_id, generate_node_id, normalize_schema_type,
 };
@@ -557,9 +558,11 @@ impl<'a> Analyzer<'a> {
         target_node: Option<&str>,
         options: &ast::WildcardAdditionalOptions,
     ) {
-        // What `* EXCLUDE (...)` or `* EXCEPT (...)` leaves out, and what
-        // `* RENAME (old AS new)` returns under another name, compared as the
-        // expanded columns' own names are. REPLACE and ILIKE are not read.
+        // What `* EXCLUDE (...)` or `* EXCEPT (...)` leaves out, what
+        // `* RENAME (old AS new)` returns under another name, and what
+        // `* REPLACE (expr AS col)` computes in a column's place, compared as
+        // the expanded columns' own names are. `* ILIKE 'pattern'` keeps only
+        // the columns whose name the pattern matches, without regard to case.
         let mut excluded: HashSet<String> = HashSet::new();
         match &options.opt_exclude {
             Some(ast::ExcludeSelectItem::Single(ident)) => {
@@ -595,6 +598,21 @@ impl<'a> Analyzer<'a> {
                 )
             })
             .collect();
+        let replaced: HashMap<String, &ast::Expr> = options
+            .opt_replace
+            .iter()
+            .flat_map(|replace| &replace.items)
+            .map(|item| {
+                (
+                    self.normalize_identifier(&item.column_name.to_string()),
+                    &item.expr,
+                )
+            })
+            .collect();
+        let ilike = options
+            .opt_ilike
+            .as_ref()
+            .map(|ilike| ilike.pattern.as_str());
 
         // Resolve wildcard sources as (canonical, qualifier) pairs so repeated
         // relation instances in self-joins are expanded independently.
@@ -659,10 +677,39 @@ impl<'a> Analyzer<'a> {
                     if excluded.contains(&normalized) {
                         continue;
                     }
+                    if ilike
+                        .is_some_and(|pattern| !like_matches_ignoring_case(pattern, &col_info.name))
+                    {
+                        continue;
+                    }
                     let name = renamed
                         .get(&normalized)
                         .cloned()
                         .unwrap_or_else(|| col_info.name.clone());
+                    // The replacing expression stands where the column was, and
+                    // reads what it reads, the column itself or any other.
+                    if let Some(expr) = replaced.get(&normalized) {
+                        let (sources, aggregation) = {
+                            let mut ea = ExpressionAnalyzer::new(self, ctx);
+                            (
+                                ea.extract_column_refs_with_warning(expr),
+                                ea.detect_aggregation(expr),
+                            )
+                        };
+                        self.add_output_column_with_aggregation(
+                            ctx,
+                            OutputColumnParams {
+                                name,
+                                sources,
+                                expression: Some(expr.to_string()),
+                                data_type: None,
+                                target_node: target_node.map(str::to_string),
+                                approximate: false,
+                                aggregation,
+                            },
+                        );
+                        continue;
+                    }
                     let sources = vec![ColumnRef {
                         table: Some(source_qualifier.clone()),
                         column: col_info.name.clone(),
@@ -1752,4 +1799,39 @@ impl<'a> Analyzer<'a> {
 
         Some(col_node_id)
     }
+}
+
+/// SQL's `LIKE`, without regard to case: `%` matches any run of characters and
+/// `_` any one. What `* ILIKE 'pattern'` keeps of a star.
+fn like_matches_ignoring_case(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let name: Vec<char> = name.to_lowercase().chars().collect();
+    // Positions in the pattern reachable after each character of the name.
+    let mut at = vec![false; pattern.len() + 1];
+    at[0] = true;
+    let close = |at: &mut Vec<bool>| {
+        for i in 0..pattern.len() {
+            if at[i] && pattern[i] == '%' {
+                at[i + 1] = true;
+            }
+        }
+    };
+    close(&mut at);
+    for c in name {
+        let mut next = vec![false; pattern.len() + 1];
+        for i in 0..pattern.len() {
+            if !at[i] {
+                continue;
+            }
+            match pattern[i] {
+                '%' => next[i] = true,
+                '_' => next[i + 1] = true,
+                p if p == c => next[i + 1] = true,
+                _ => {}
+            }
+        }
+        close(&mut next);
+        at = next;
+    }
+    at[pattern.len()]
 }
