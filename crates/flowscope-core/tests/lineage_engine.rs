@@ -2430,46 +2430,48 @@ fn cte_self_join_alias_columns_do_not_leak_across_union_scopes() {
         .iter()
         .find(|node| node.node_type == NodeType::Output)
         .expect("Output node should exist");
-    let dept_output = stmt
+    // The branches pair by position: the output has the first branch's name
+    // only, and the second branch's `b.name` flows into it.
+    let output_columns: Vec<_> = stmt
         .nodes
         .iter()
-        .find(|node| {
+        .filter(|node| {
             node.node_type == NodeType::Column
-                && &*node.label == "dept_name"
                 && stmt.edges.iter().any(|edge| {
                     edge.edge_type == EdgeType::Ownership
                         && edge.from == output_node.id
                         && edge.to == node.id
                 })
         })
-        .expect("dept_name output column should exist");
-
-    let dept_source_ids: HashSet<_> = stmt
-        .edges
-        .iter()
-        .filter(|edge| edge.edge_type == EdgeType::DataFlow && edge.to == dept_output.id)
-        .map(|edge| edge.from.clone())
         .collect();
-    assert!(
-        !dept_source_ids.is_empty(),
-        "dept_name should receive a direct data-flow edge from the dept branch source column"
+    assert_eq!(
+        output_columns
+            .iter()
+            .map(|node| node.label.to_string())
+            .collect::<Vec<_>>(),
+        vec!["emp_name"],
+        "a UNION's output takes its first branch's names"
     );
 
+    let source_ids: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::DataFlow && edge.to == output_columns[0].id)
+        .map(|edge| edge.from.clone())
+        .collect();
     let source_owner_labels: HashSet<_> = stmt
         .edges
         .iter()
-        .filter(|edge| edge.edge_type == EdgeType::Ownership && dept_source_ids.contains(&edge.to))
+        .filter(|edge| edge.edge_type == EdgeType::Ownership && source_ids.contains(&edge.to))
         .filter_map(|edge| stmt.nodes.iter().find(|node| node.id == edge.from))
         .map(|node| node.label.to_string())
         .collect();
 
-    assert!(
-        source_owner_labels.contains("dept"),
-        "dept_name should be sourced from a dept CTE instance, saw owners {source_owner_labels:?}"
-    );
-    assert!(
-        !source_owner_labels.contains("emp"),
-        "dept_name should not reuse emp columns when aliases are reused across UNION branches, saw owners {source_owner_labels:?}"
+    // Each branch's `b` is its own CTE: the dept branch must not reuse emp's.
+    assert_eq!(
+        source_owner_labels,
+        HashSet::from(["emp".to_string(), "dept".to_string()]),
+        "each branch should read its own CTE instance, saw owners {source_owner_labels:?}"
     );
 }
 
@@ -13422,5 +13424,129 @@ fn an_outer_cte_named_like_an_inlined_model_s_inner_one_reads_through_it() {
     assert_eq!(
         base_sources_of(&stmt, "out_ts"),
         expected_sources(&["t.ts"])
+    );
+}
+
+#[test]
+fn a_union_pairs_its_branches_by_position() {
+    // The second branch names its columns otherwise: SQL pairs them with the
+    // first branch's by position, and the output has the first branch's names.
+    let sql = r#"
+        SELECT k, a AS x FROM t1
+        UNION ALL
+        SELECT m.k, m.b FROM t2 AS m
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "t1", &["k", "a"]),
+        schema_table(None, None, "t2", &["k", "b"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    // The output has the first branch's names, none of the second's.
+    let output = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let mut outputs: Vec<String> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::Ownership && edge.from == output.id)
+        .filter_map(|edge| stmt.nodes.iter().find(|node| node.id == edge.to))
+        .map(|node| node.label.to_lowercase())
+        .collect();
+    outputs.sort();
+    assert_eq!(outputs, vec!["k", "x"]);
+    assert_eq!(
+        base_sources_of(&stmt, "x"),
+        expected_sources(&["t1.a", "t2.b"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "k"),
+        expected_sources(&["t1.k", "t2.k"])
+    );
+}
+
+#[test]
+fn a_union_in_a_cte_pairs_by_position_through_its_stars_and_nesting() {
+    // Three branches, the last a star, inside a CTE the statement reads.
+    let sql = r#"
+        WITH u AS (
+            SELECT k, 'one' AS origin, a AS x FROM t1
+            UNION ALL
+            SELECT k, 'two', b FROM t2
+            UNION ALL
+            SELECT * FROM t3
+        )
+        SELECT u.k, u.origin, u.x FROM u
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "t1", &["k", "a"]),
+        schema_table(None, None, "t2", &["k", "b"]),
+        schema_table(None, None, "t3", &["kk", "label", "c"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "x"),
+        expected_sources(&["t1.a", "t2.b", "t3.c"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "k"),
+        expected_sources(&["t1.k", "t2.k", "t3.kk"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "origin"),
+        expected_sources(&["t3.label"])
+    );
+}
+
+#[test]
+fn a_union_by_name_still_pairs_by_name() {
+    let sql = r#"
+        SELECT k, a AS x FROM t1
+        UNION ALL BY NAME
+        SELECT b AS x, k FROM t2
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "t1", &["k", "a"]),
+        schema_table(None, None, "t2", &["k", "b"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "x"),
+        expected_sources(&["t1.a", "t2.b"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "k"),
+        expected_sources(&["t1.k", "t2.k"])
+    );
+}
+
+#[test]
+fn a_derived_table_inside_a_later_branch_keeps_its_own_names() {
+    let sql = r#"
+        SELECT k, a AS x FROM t1
+        UNION ALL
+        SELECT d.k, d.y FROM (SELECT k, b AS y FROM t2) AS d
+    "#;
+    let schema = schema_of(vec![
+        schema_table(None, None, "t1", &["k", "a"]),
+        schema_table(None, None, "t2", &["k", "b"]),
+    ]);
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "x"),
+        expected_sources(&["t1.a", "t2.b"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "k"),
+        expected_sources(&["t1.k", "t2.k"])
     );
 }

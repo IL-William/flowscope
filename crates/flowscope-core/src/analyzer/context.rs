@@ -154,6 +154,13 @@ pub(crate) struct StatementContext {
     /// How many subqueries a predicate reads the statement has opened, each
     /// analysed against a node of its own.
     pub(crate) predicate_subqueries: usize,
+    /// While a later branch of a set operation is read, the names its columns
+    /// take. SQL pairs the branches of a UNION, an INTERSECT or an EXCEPT by
+    /// position, not by name, unless it says BY NAME.
+    pub(crate) branch_names: Option<BranchNames>,
+    /// The first branch's names of the set operation read last, for one that
+    /// holds it as its own first branch.
+    pub(crate) last_branch_names: Option<(Option<String>, Vec<String>)>,
     /// Last join/operation type for edge labeling
     pub(crate) last_operation: Option<String>,
     /// Current join information (type + condition) for edge labeling
@@ -214,6 +221,17 @@ pub(crate) struct StatementContext {
     pub(crate) instance_limit_reached: bool,
 }
 
+/// The names a later branch of a set operation gives its columns: the first
+/// branch's, by position. Only columns of `target` take them, so that a
+/// derived table or a subquery inside the branch keeps its own.
+#[derive(Debug, Clone)]
+pub(crate) struct BranchNames {
+    pub(crate) target: Option<String>,
+    pub(crate) names: Vec<String>,
+    /// The position of the next column the branch gives `target`.
+    pub(crate) next: usize,
+}
+
 /// Represents an output column in the SELECT list
 #[derive(Debug, Clone)]
 pub(crate) struct OutputColumn {
@@ -252,6 +270,8 @@ impl StatementContext {
             derived_occurrences: HashMap::new(),
             cte_occurrences: HashMap::new(),
             predicate_subqueries: 0,
+            branch_names: None,
+            last_branch_names: None,
             last_operation: None,
             current_join_info: JoinInfo::default(),
             table_node_ids: HashMap::new(),
