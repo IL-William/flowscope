@@ -13611,3 +13611,35 @@ fn star_replace_computes_the_column_it_replaces() {
         );
     }
 }
+
+#[test]
+fn a_column_wins_over_an_earlier_alias_of_its_name() {
+    // Snowflake and DuckDB read p.b into c: the table's column wins over the
+    // alias b, alone or inside an expression, through a CTE as well.
+    for dialect in [Dialect::Snowflake, Dialect::Duckdb] {
+        for (sql, output, sources) in [
+            ("SELECT a AS b, b AS c FROM p", "c", vec!["p.b"]),
+            ("SELECT a AS b, UPPER(b) AS c FROM p", "c", vec!["p.b"]),
+            (
+                "SELECT a || c AS b, b || a AS d FROM p",
+                "d",
+                vec!["p.a", "p.b"],
+            ),
+            (
+                "WITH w AS (SELECT a, b FROM p) SELECT a AS b, b AS c FROM w",
+                "c",
+                vec!["p.b"],
+            ),
+            // An alias no source has a column for is still read through.
+            ("SELECT a AS x, x AS y FROM p", "y", vec!["p.a"]),
+        ] {
+            let result = run_analysis(sql, dialect, Some(star_options_schema()));
+            let stmt = first_statement(&result);
+            assert_eq!(
+                base_sources_of(&stmt, output),
+                expected_sources(&sources),
+                "{dialect:?}: {sql}"
+            );
+        }
+    }
+}

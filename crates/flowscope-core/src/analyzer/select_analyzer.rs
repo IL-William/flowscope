@@ -263,6 +263,12 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
     /// When processing `c`, the identifier `b` matches the lateral alias, so we
     /// resolve `c`'s sources to include `t.a` (via `b`) instead of treating `b`
     /// as an unresolved column reference.
+    ///
+    /// A column of the `FROM` wins over an alias of its name: in
+    /// `SELECT a AS b, b AS c FROM t` where `t` has `b`, Snowflake and DuckDB
+    /// read `t.b` into `c`. So an identifier a source in scope is known to
+    /// have stays a column reference. When no source is known to have it, the
+    /// alias is the only name in sight, and it is taken.
     fn resolve_lateral_alias_sources(
         &self,
         expr: &sqlparser::ast::Expr,
@@ -280,6 +286,13 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
         for ident in &identifiers {
             let normalized_ident = self.analyzer.normalize_identifier(ident);
             if let Some(alias_sources) = lateral_alias_sources.get(&normalized_ident) {
+                if !self
+                    .analyzer
+                    .candidate_tables_for_column(self.ctx, ident)
+                    .is_empty()
+                {
+                    continue;
+                }
                 // This identifier is a lateral alias reference. Add the alias's sources
                 // to our sources list, and remove any ColumnRef that just has the alias
                 // name without a table (since it's not a real table column).
