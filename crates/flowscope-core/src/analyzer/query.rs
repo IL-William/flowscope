@@ -839,7 +839,11 @@ impl<'a> Analyzer<'a> {
             .or_else(|| ctx.cte_definitions.get(&canonical).cloned())
     }
 
-    fn candidate_tables_for_column(&self, ctx: &StatementContext, column: &str) -> Vec<String> {
+    pub(super) fn candidate_tables_for_column(
+        &self,
+        ctx: &StatementContext,
+        column: &str,
+    ) -> Vec<String> {
         let tables_in_scope = ctx.tables_in_current_scope();
         let normalized_col = self.normalize_identifier(column);
         let mut candidate_tables: Vec<String> = Vec::new();
