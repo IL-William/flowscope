@@ -1,5 +1,6 @@
 ---
 source: crates/flowscope-core/tests/snapshots.rs
+assertion_line: 27
 expression: clean_result
 ---
 {
@@ -269,6 +270,15 @@ expression: clean_result
       "from": "cte_13c6a0ce2ba7fbed",
       "to": "column_f0521d6d6b3f8f6b",
       "type": "ownership",
+      "statementIds": [
+        0
+      ]
+    },
+    {
+      "id": "edge_8e6e75d17a8dea9d",
+      "from": "column_78a6f51170482ff9",
+      "to": "column_a5ca696854a3dcdd",
+      "type": "data_flow",
       "statementIds": [
         0
       ]
