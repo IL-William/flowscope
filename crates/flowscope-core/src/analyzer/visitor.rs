@@ -285,6 +285,13 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
             .add_source_table(self.ctx, table_name, self.target_node.as_deref(), None)
     }
 
+    /// Registers the alias of a relation no table owns (a table function, an
+    /// UNNEST, a PIVOT) in the current scope, keyed as qualifiers are looked up.
+    fn register_subquery_alias(&mut self, alias: String) {
+        let normalized = self.analyzer.normalize_identifier(&alias);
+        self.ctx.register_subquery_alias_in_scope(alias, normalized);
+    }
+
     pub fn add_source_table_with_alias(
         &mut self,
         table_name: &str,
@@ -487,8 +494,7 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
         let alias_name = alias.map_or_else(|| name.to_string(), |a| a.name.to_string());
         // What is read through the alias belongs to no table, so it stays out
         // of the implied schema, as a derived table's columns do.
-        self.ctx
-            .register_subquery_alias_in_scope(alias_name.clone());
+        self.register_subquery_alias(alias_name.clone());
         // At table level the input is a column of a relation already in the
         // FROM clause: a FLATTEN node would have nothing to connect to.
         if !self.analyzer.column_lineage_enabled {
@@ -799,6 +805,14 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
         for table_with_joins in &select.from {
             self.visit_table_with_joins(table_with_joins);
         }
+        // A lateral view names a relation of this select that no table owns:
+        // its name must not resolve to an enclosing query's alias.
+        for lateral_view in &select.lateral_views {
+            let name = self
+                .analyzer
+                .normalize_identifier(&lateral_view.lateral_view_name.to_string());
+            self.ctx.register_opaque_name_in_scope(name);
+        }
         if self.analyzer.column_lineage_enabled {
             let sink_node = self.ctx.sink_node_id().map(|node_id| node_id.to_string());
             let target_node = self.target_node.clone().or(sink_node);
@@ -837,9 +851,23 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                 let table_name = name.to_string();
                 let alias_str = alias.as_ref().map(|a| a.name.to_string());
                 let canonical = self.add_source_table_with_alias(&table_name, alias_str.as_deref());
-                if let (Some(a), Some(canonical_name)) = (&alias_str, &canonical) {
-                    self.ctx
-                        .register_alias_in_scope(a.clone(), canonical_name.clone());
+                match (&alias_str, &canonical) {
+                    (Some(a), Some(canonical_name)) => {
+                        self.ctx
+                            .register_alias_in_scope(a.clone(), canonical_name.clone());
+                    }
+                    // A CTE too: its name must not resolve to an enclosing
+                    // alias of the same name either.
+                    (None, Some(canonical_name)) => {
+                        let bare = crate::analyzer::helpers::extract_simple_name(canonical_name);
+                        // Normalized as a qualifier is, so a quoted upper-case
+                        // name still meets `reviews` where identifiers match
+                        // without regard to case.
+                        let key = self.analyzer.normalize_identifier(&bare);
+                        self.ctx
+                            .register_bare_table_in_scope(key, canonical_name.clone());
+                    }
+                    _ => {}
                 }
             }
             TableFactor::Derived {
@@ -938,8 +966,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     self.ctx.mark_table_function_in_scope();
                 }
                 if let Some(a) = alias {
-                    self.ctx
-                        .register_subquery_alias_in_scope(a.name.to_string());
+                    self.register_subquery_alias(a.name.to_string());
                 }
                 self.analyzer.issues.push(
                     Issue::info(
@@ -964,8 +991,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     self.ctx.mark_table_function_in_scope();
                 }
                 if let Some(a) = alias {
-                    self.ctx
-                        .register_subquery_alias_in_scope(a.name.to_string());
+                    self.register_subquery_alias(a.name.to_string());
                 }
                 self.analyzer.issues.push(
                     Issue::info(
@@ -1004,8 +1030,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     }
                 }
                 if let Some(a) = alias {
-                    self.ctx
-                        .register_subquery_alias_in_scope(a.name.to_string());
+                    self.register_subquery_alias(a.name.to_string());
                 }
                 self.analyzer.issues.push(
                     Issue::warning(
@@ -1026,8 +1051,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     self.extract_identifiers_from_expr(&col.expr);
                 }
                 if let Some(a) = alias {
-                    self.ctx
-                        .register_subquery_alias_in_scope(a.name.to_string());
+                    self.register_subquery_alias(a.name.to_string());
                 }
                 self.analyzer.issues.push(
                     Issue::warning(
@@ -1057,8 +1081,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     }
                 }
                 if let Some(a) = alias {
-                    self.ctx
-                        .register_subquery_alias_in_scope(a.name.to_string());
+                    self.register_subquery_alias(a.name.to_string());
                 }
             }
             _ => {}

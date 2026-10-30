@@ -54,8 +54,14 @@ pub(crate) struct Scope {
     /// name (e.g., `"employees"`) and the fully-qualified canonical name
     /// (e.g., `"public.employees"`) are registered so that either form resolves.
     pub(crate) alias_instances: HashMap<String, RelationInstance>,
-    /// Subquery aliases in this scope
+    /// Subquery aliases in this scope, normalized as identifiers are folded
     pub(crate) subquery_aliases: HashSet<String>,
+    /// Normalized bare name -> canonical name of the tables and CTEs this
+    /// scope's FROM reads without an alias, so `reviews.book_id` finds
+    /// `LAB.RAW.REVIEWS` in this scope before an enclosing scope's alias of the
+    /// same name. `None` marks a name two different relations of the scope
+    /// share: it resolves to neither, and the search goes no further out.
+    pub(crate) bare_tables: HashMap<String, Option<String>>,
     /// Scope-local output columns for subquery/CTE aliases materialized in this scope.
     /// These shadow statement-global CTE definitions when alias names are reused.
     pub(crate) subquery_columns: HashMap<String, Vec<OutputColumn>>,
@@ -656,11 +662,28 @@ impl StatementContext {
     /// Resolve an alias to its relation instance (canonical name + node_id).
     ///
     /// Searches the scope stack from innermost to outermost scope. Returns `None`
-    /// if the alias is not registered as an instance in any scope.
-    pub(crate) fn resolve_alias_instance(&self, alias: &str) -> Option<&RelationInstance> {
+    /// if the alias is not registered as an instance in any scope. A scope that
+    /// reads a table without an alias under the bare name `normalized` (the
+    /// qualifier, normalized as the dialect folds identifiers), or defines the
+    /// name with no table behind it, answers before an enclosing scope's alias.
+    pub(crate) fn resolve_alias_instance(
+        &self,
+        alias: &str,
+        normalized: &str,
+    ) -> Option<&RelationInstance> {
         for scope in self.scope_stack.iter().rev() {
             if let Some(instance) = scope.alias_instances.get(alias) {
                 return Some(instance);
+            }
+            if let Some(known) = scope.bare_tables.get(normalized) {
+                return known.as_ref().and_then(|canonical| {
+                    scope
+                        .alias_instances
+                        .get(&super::helpers::extract_simple_name(canonical))
+                });
+            }
+            if scope.subquery_aliases.contains(normalized) {
+                return None;
             }
         }
         None
@@ -692,14 +715,43 @@ impl StatementContext {
             .count()
     }
 
-    /// Register a subquery alias in the current scope
-    pub(crate) fn register_subquery_alias_in_scope(&mut self, alias: String) {
+    /// Register a subquery alias in the current scope.
+    ///
+    /// The global set keeps the alias as written; the scope's is keyed by
+    /// `normalized`, the alias as the dialect folds identifiers, which is how
+    /// `resolve_table_alias` and `resolve_alias_instance` look a qualifier up.
+    pub(crate) fn register_subquery_alias_in_scope(&mut self, alias: String, normalized: String) {
         // Register globally
-        self.subquery_aliases.insert(alias.clone());
+        self.subquery_aliases.insert(alias);
 
         // Also register in current scope
         if let Some(scope) = self.current_scope_mut() {
-            scope.subquery_aliases.insert(alias);
+            scope.subquery_aliases.insert(normalized);
+        }
+    }
+
+    /// Register a table read without an alias under its bare name, so a
+    /// qualifier spelled that way resolves here and not to an enclosing alias.
+    pub(crate) fn register_bare_table_in_scope(&mut self, bare_name: String, canonical: String) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope
+                .bare_tables
+                .entry(bare_name)
+                .and_modify(|known| {
+                    if known.as_deref() != Some(canonical.as_str()) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(canonical));
+        }
+    }
+
+    /// Register a name the current scope defines but no table owns, such as a
+    /// lateral view's, so it shadows an enclosing alias of the same name. The
+    /// name is stored normalized, as the keys of `bare_tables` are.
+    pub(crate) fn register_opaque_name_in_scope(&mut self, name: String) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.subquery_aliases.insert(name);
         }
     }
 

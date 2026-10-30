@@ -13928,3 +13928,211 @@ fn any_and_all_subqueries_in_a_select_list_test_rows_like_in() {
         );
     }
 }
+
+fn unaliased_scope_schema() -> SchemaMetadata {
+    SchemaMetadata {
+        allow_implied: false,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![
+            schema_table(
+                Some("LAB"),
+                Some("RAW"),
+                "EVENTS",
+                &["id", "book_id", "tags"],
+            ),
+            schema_table(
+                Some("LAB"),
+                Some("RAW"),
+                "REVIEWS",
+                &["id", "book_id", "stars", "tags"],
+            ),
+            schema_table(
+                Some("LAB"),
+                Some("ARCHIVE"),
+                "REVIEWS",
+                &["id", "book_id", "stars", "tags"],
+            ),
+            schema_table(
+                Some("LAB"),
+                Some("SHELF"),
+                "LOANS_ENRICHED",
+                &["loan_id", "book_id"],
+            ),
+            schema_table(Some("LAB"), Some("SHELF"), "BOOKS", &["book_id", "title"]),
+        ],
+    }
+}
+
+fn filters_of(stmt: &StmtView<'_>, table: &str) -> Vec<String> {
+    stmt.nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Table && node.label.eq_ignore_ascii_case(table))
+        .unwrap_or_else(|| panic!("table {table} not found"))
+        .filters
+        .iter()
+        .map(|filter| filter.expression.clone())
+        .collect()
+}
+
+#[test]
+fn an_unaliased_table_shadows_an_outer_alias_of_its_name() {
+    // Under the outer alias `reviews` for EVENTS, the subquery's own table is
+    // REVIEWS, spelled bare, and its filter belongs to it.
+    // DuckDB matches identifiers without regard to case, quoted or not, so the
+    // quoted upper-case spelling must shadow the lower-case qualifier too.
+    for (dialect, inner, label) in [
+        (Dialect::Snowflake, "LAB.RAW.REVIEWS", "unquoted"),
+        (Dialect::Snowflake, r#""LAB"."RAW"."REVIEWS""#, "quoted"),
+        (Dialect::Duckdb, "LAB.RAW.REVIEWS", "duckdb unquoted"),
+        (Dialect::Duckdb, r#""LAB"."RAW"."REVIEWS""#, "duckdb quoted"),
+    ] {
+        for (sql, what) in [
+            (
+                format!(
+                    "SELECT reviews.id FROM LAB.RAW.EVENTS AS reviews \
+                     WHERE EXISTS (SELECT 1 FROM {inner} WHERE reviews.book_id = 1)"
+                ),
+                "EXISTS",
+            ),
+            (
+                format!(
+                    "SELECT reviews.id, \
+                     (SELECT MAX(stars) FROM {inner} WHERE reviews.book_id = 1) AS best \
+                     FROM LAB.RAW.EVENTS AS reviews"
+                ),
+                "select list",
+            ),
+        ] {
+            let result = run_analysis(&sql, dialect, Some(unaliased_scope_schema()));
+            let stmt = first_statement(&result);
+            assert_eq!(
+                filters_of(&stmt, "reviews"),
+                ["reviews.book_id = 1"],
+                "{label} {what}: {sql}"
+            );
+            assert!(
+                filters_of(&stmt, "events").is_empty(),
+                "{label} {what}: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_outer_unaliased_table_is_still_read_through_its_bare_name() {
+    let sql = "SELECT reviews.id, reviews.stars FROM LAB.RAW.REVIEWS WHERE reviews.book_id = 1";
+    for dialect in [Dialect::Snowflake, Dialect::Duckdb] {
+        let result = run_analysis(sql, dialect, Some(unaliased_scope_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(
+            base_sources_of(&stmt, "stars"),
+            expected_sources(&["reviews.stars"]),
+            "{dialect:?}"
+        );
+        assert_eq!(
+            filters_of(&stmt, "reviews"),
+            ["reviews.book_id = 1"],
+            "{dialect:?}"
+        );
+    }
+}
+
+#[test]
+fn a_lateral_view_name_shadows_an_outer_alias() {
+    // The view's name is compared as identifiers are, so `E` shadows `e`.
+    for view in ["e", "E"] {
+        let sql = format!(
+            "SELECT e.id FROM LAB.RAW.EVENTS AS e \
+             WHERE EXISTS (SELECT 1 FROM LAB.RAW.REVIEWS AS r \
+             LATERAL VIEW explode(r.tags) {view} AS value WHERE e.value = 1)"
+        );
+        let result = run_analysis(&sql, Dialect::Databricks, Some(unaliased_scope_schema()));
+        let stmt = first_statement(&result);
+        assert!(
+            filters_of(&stmt, "EVENTS").is_empty(),
+            "{view}: EVENTS: {:?}",
+            filters_of(&stmt, "EVENTS")
+        );
+    }
+}
+
+#[test]
+fn an_unaliased_cte_shadows_an_outer_alias_of_its_name() {
+    let sql = "WITH reviews AS (SELECT id, stars FROM LAB.RAW.REVIEWS) \
+               SELECT reviews.id, (SELECT MAX(reviews.stars) FROM reviews) AS best \
+               FROM LAB.RAW.EVENTS AS reviews";
+    let result = run_analysis(sql, Dialect::Snowflake, Some(unaliased_scope_schema()));
+    let stmt = first_statement(&result);
+    assert!(result.issues.is_empty(), "issues: {:?}", result.issues);
+    // The value comes through the CTE from REVIEWS, not from EVENTS.
+    assert_eq!(
+        base_sources_of(&stmt, "best"),
+        expected_sources(&["reviews.stars"])
+    );
+    assert!(!table_feeds_column(&stmt, "EVENTS", "best"));
+}
+
+#[test]
+fn a_bare_name_two_unaliased_tables_share_resolves_to_neither() {
+    let sql = "SELECT reviews.stars FROM LAB.RAW.REVIEWS CROSS JOIN LAB.ARCHIVE.REVIEWS";
+    let result = run_analysis(sql, Dialect::Snowflake, Some(unaliased_scope_schema()));
+    let stmt = first_statement(&result);
+    assert!(
+        base_sources_of(&stmt, "stars").is_empty(),
+        "sources: {:?}",
+        base_sources_of(&stmt, "stars")
+    );
+}
+
+#[test]
+fn columns_qualified_with_the_bare_name_of_unaliased_tables_are_read() {
+    let sql = "SELECT loans_enriched.loan_id, books.title \
+               FROM LAB.SHELF.LOANS_ENRICHED \
+               INNER JOIN LAB.SHELF.BOOKS ON loans_enriched.book_id = books.book_id";
+    for dialect in [Dialect::Snowflake, Dialect::Duckdb] {
+        let result = run_analysis(sql, dialect, Some(unaliased_scope_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(
+            base_sources_of(&stmt, "loan_id"),
+            expected_sources(&["loans_enriched.loan_id"]),
+            "{dialect:?}"
+        );
+        assert_eq!(
+            base_sources_of(&stmt, "title"),
+            expected_sources(&["books.title"]),
+            "{dialect:?}"
+        );
+    }
+}
+
+#[test]
+fn a_table_function_alias_shadows_an_outer_alias_of_its_name() {
+    // `g` names the generator in the subquery; the filter on it is not EVENTS's.
+    let sql = "SELECT g.id FROM LAB.RAW.EVENTS AS g \
+               WHERE EXISTS (SELECT 1 FROM TABLE(GENERATOR(ROWCOUNT => 3)) AS g WHERE g.id = 1)";
+    let result = run_analysis(sql, Dialect::Snowflake, Some(unaliased_scope_schema()));
+    let stmt = first_statement(&result);
+    assert!(
+        filters_of(&stmt, "EVENTS").is_empty(),
+        "EVENTS: {:?}",
+        filters_of(&stmt, "EVENTS")
+    );
+}
+
+#[test]
+fn an_upper_case_unnest_alias_shadows_a_lower_case_outer_alias() {
+    // Postgres folds `U` and `u` to one name; an UNNEST alias is stored as the
+    // dialect folds it, so the filter on `u.id` is the subquery's, not EVENTS's.
+    let sql = "SELECT u.id FROM LAB.RAW.EVENTS AS u \
+               WHERE EXISTS (SELECT 1 FROM UNNEST(ARRAY[1, 2]) AS U(id) WHERE u.id = 1)";
+    let result = run_analysis(sql, Dialect::Postgres, Some(unaliased_scope_schema()));
+    let stmt = first_statement(&result);
+    assert!(
+        filters_of(&stmt, "events").is_empty(),
+        "events: {:?}",
+        filters_of(&stmt, "events")
+    );
+}
