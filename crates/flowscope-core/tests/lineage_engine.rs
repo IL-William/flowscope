@@ -13643,3 +13643,288 @@ fn a_column_wins_over_an_earlier_alias_of_its_name() {
         }
     }
 }
+
+fn shelf_schema() -> SchemaMetadata {
+    SchemaMetadata {
+        allow_implied: false,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![
+            schema_table(
+                Some("LAB"),
+                Some("SHELF"),
+                "BOOKS",
+                &["book_id", "title", "tags", "genre_code"],
+            ),
+            schema_table(
+                Some("LAB"),
+                Some("RAW"),
+                "REVIEWS",
+                &["review_id", "book_id", "stars", "written_at"],
+            ),
+        ],
+    }
+}
+
+/// True when an edge of any type runs from the table node `table` to the
+/// column node labelled `output` (compared without case).
+fn table_feeds_column(stmt: &StmtView<'_>, table: &str, output: &str) -> bool {
+    let table = find_table_node(stmt, table).unwrap_or_else(|| panic!("table {table} not found"));
+    stmt.nodes
+        .iter()
+        .filter(|node| {
+            node.node_type == NodeType::Column && node.label.eq_ignore_ascii_case(output)
+        })
+        .any(|column| {
+            stmt.edges
+                .iter()
+                .any(|edge| edge.from == table.id && edge.to == column.id)
+        })
+}
+
+#[test]
+fn scalar_subquery_in_a_select_list_feeds_its_column() {
+    let sql = r#"
+        SELECT
+            b.book_id,
+            (SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r WHERE r.book_id = b.book_id) AS best_stars,
+            (SELECT MAX(r.written_at) FROM LAB.RAW.REVIEWS AS r) AS last_review_at
+        FROM LAB.SHELF.BOOKS AS b
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(shelf_schema()));
+    let stmt = first_statement(&result);
+
+    // The output column is drawn from the subquery's own column, which reads
+    // the table the subquery names.
+    assert_eq!(
+        source_columns_of(&stmt, "best_stars"),
+        expected_sources(&["(subquery).max"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "best_stars"),
+        expected_sources(&["reviews.stars"])
+    );
+    assert_eq!(
+        source_columns_of(&stmt, "last_review_at"),
+        expected_sources(&["(subquery).max"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "last_review_at"),
+        expected_sources(&["reviews.written_at"])
+    );
+    assert_eq!(
+        base_sources_of(&stmt, "book_id"),
+        expected_sources(&["books.book_id"])
+    );
+
+    // The enclosing table no longer stands in for what the subquery reads.
+    assert!(!table_feeds_column(&stmt, "BOOKS", "best_stars"));
+    assert!(!table_feeds_column(&stmt, "BOOKS", "last_review_at"));
+    assert_eq!(
+        returned_columns(&stmt),
+        vec!["best_stars", "book_id", "last_review_at"]
+    );
+}
+
+#[test]
+fn correlated_scalar_subquery_filters_itself_and_resolves_the_outer_alias() {
+    // The engine keeps a predicate that spans two relations out of the filters
+    // (it is a correlation, not a restriction of either), so the literal one
+    // shows where the subquery's WHERE lands: on REVIEWS, never on BOOKS.
+    let sql = r#"
+        SELECT
+            b.book_id,
+            (SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r WHERE r.book_id = b.book_id AND r.stars > 2) AS best_stars
+        FROM LAB.SHELF.BOOKS AS b
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(shelf_schema()));
+    let stmt = first_statement(&result);
+
+    let reviews = find_table_node(&stmt, "REVIEWS").expect("REVIEWS table not found");
+    let books = find_table_node(&stmt, "BOOKS").expect("BOOKS table not found");
+    assert_eq!(
+        reviews
+            .filters
+            .iter()
+            .map(|filter| filter.expression.as_str())
+            .collect::<Vec<_>>(),
+        ["r.stars > 2"]
+    );
+    assert!(books.filters.is_empty(), "books: {:?}", books.filters);
+    assert!(result.issues.is_empty(), "issues: {:?}", result.issues);
+}
+
+#[test]
+fn scalar_subquery_inside_a_function_or_case_feeds_beside_the_outer_column() {
+    for (sql, output, sources) in [
+        (
+            "SELECT COALESCE((SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r WHERE r.book_id = b.book_id), b.genre_code) AS best \
+             FROM LAB.SHELF.BOOKS AS b",
+            "best",
+            vec!["reviews.stars", "books.genre_code"],
+        ),
+        (
+            "SELECT CASE WHEN b.genre_code = 'x' THEN (SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r) ELSE b.title END AS best \
+             FROM LAB.SHELF.BOOKS AS b",
+            "best",
+            vec!["reviews.stars", "books.title", "books.genre_code"],
+        ),
+        (
+            "SELECT CAST((SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r) AS VARCHAR) || b.title AS best \
+             FROM LAB.SHELF.BOOKS AS b",
+            "best",
+            vec!["reviews.stars", "books.title"],
+        ),
+    ] {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(shelf_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(
+            base_sources_of(&stmt, output),
+            expected_sources(&sources),
+            "{sql}"
+        );
+        assert!(result.issues.is_empty(), "{sql}: {:?}", result.issues);
+    }
+}
+
+#[test]
+fn exists_in_a_select_list_is_left_as_it_was() {
+    // EXISTS tests rows, it carries no column: the output column reads
+    // nothing from the subquery's table.
+    let sql = "SELECT EXISTS (SELECT 1 FROM LAB.RAW.REVIEWS AS r WHERE r.book_id = b.book_id) AS reviewed \
+               FROM LAB.SHELF.BOOKS AS b";
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(shelf_schema()));
+    let stmt = first_statement(&result);
+    assert!(base_sources_of(&stmt, "reviewed")
+        .iter()
+        .all(|source| !source.starts_with("reviews.")));
+}
+
+#[test]
+fn scalar_subquery_leaves_the_grouping_of_the_enclosing_select_alone() {
+    // The subquery's own select clears the grouping it finds; the items after
+    // it must still tell a grouping key from an aggregate.
+    let grouped = "COUNT(*) AS n FROM LAB.SHELF.BOOKS AS b GROUP BY b.genre_code";
+    let plain = format!("SELECT b.genre_code, {grouped}");
+    let with_subquery = format!(
+        "SELECT (SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r) AS m, b.genre_code, {grouped}"
+    );
+
+    // Whether the `genre_code` columns of the graph carry an aggregation entry
+    // that marks them as a grouping key.
+    let grouping_keys = |sql: &str| {
+        let result = run_analysis(sql, Dialect::Snowflake, Some(shelf_schema()));
+        let stmt = first_statement(&result);
+        stmt.nodes
+            .iter()
+            .filter(|n| {
+                n.node_type == NodeType::Column && n.label.eq_ignore_ascii_case("genre_code")
+            })
+            .map(|n| n.aggregation.as_ref().is_some_and(|a| a.is_grouping_key))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(grouping_keys(&with_subquery), grouping_keys(&plain));
+    assert!(
+        grouping_keys(&with_subquery).contains(&true),
+        "genre_code stays a grouping key"
+    );
+}
+
+#[test]
+fn scalar_subquery_in_a_cte_body_feeds_the_cte_column() {
+    let sql = r#"
+        WITH rated AS (
+            SELECT
+                b.book_id,
+                (SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r WHERE r.book_id = b.book_id) AS best_stars
+            FROM LAB.SHELF.BOOKS AS b
+        )
+        SELECT book_id, best_stars FROM rated
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(shelf_schema()));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "best_stars"),
+        expected_sources(&["reviews.stars"])
+    );
+    assert!(!table_feeds_column(&stmt, "BOOKS", "best_stars"));
+    assert_eq!(
+        returned_columns(&stmt),
+        vec!["best_stars", "book_id"],
+        "the subquery's column is not a column of the CTE"
+    );
+}
+
+#[test]
+fn scalar_subquery_inside_more_function_forms_feeds_the_column() {
+    for sql in [
+        "SELECT TRIM((SELECT MAX(r.written_at) FROM LAB.RAW.REVIEWS AS r)) AS v FROM LAB.SHELF.BOOKS AS b",
+        "SELECT SUBSTRING((SELECT MAX(r.written_at) FROM LAB.RAW.REVIEWS AS r) FROM 1 FOR 4) AS v FROM LAB.SHELF.BOOKS AS b",
+        "SELECT (SELECT MAX(r.written_at) FROM LAB.RAW.REVIEWS AS r) AT TIME ZONE 'UTC' AS v FROM LAB.SHELF.BOOKS AS b",
+    ] {
+        let result = run_analysis(sql, Dialect::Postgres, Some(shelf_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(
+            base_sources_of(&stmt, "v"),
+            expected_sources(&["reviews.written_at"]),
+            "{sql}"
+        );
+        assert!(!table_feeds_column(&stmt, "books", "v"), "{sql}");
+    }
+}
+
+#[test]
+fn scalar_subquery_through_a_lateral_alias_stays_out_of_the_implied_schema() {
+    // `m1` reads the subquery through the lateral alias `m`. The key the
+    // subquery is registered under must not become an implied table, which a
+    // later statement's own subquery would then be checked against.
+    let sql = "SELECT (SELECT MAX(r.stars) FROM LAB.RAW.REVIEWS AS r) AS m, m + 1 AS m1 FROM LAB.SHELF.BOOKS AS b;\n\
+               SELECT (SELECT MIN(r.written_at) AS first_at FROM LAB.RAW.REVIEWS AS r) AS f FROM LAB.SHELF.BOOKS AS b;";
+    let mut schema = shelf_schema();
+    schema.allow_implied = true;
+
+    let result = run_analysis(sql, Dialect::Snowflake, Some(schema));
+    let stmt = first_statement(&result);
+    assert_eq!(
+        base_sources_of(&stmt, "m1"),
+        expected_sources(&["reviews.stars"])
+    );
+    let resolved = result.resolved_schema.as_ref().expect("resolved schema");
+    assert!(
+        resolved
+            .tables
+            .iter()
+            .all(|table| !table.name.contains("(subquery)")),
+        "tables: {:?}",
+        resolved.tables.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !issue_codes_list(&result).contains(&issue_codes::UNKNOWN_COLUMN.to_string()),
+        "issues: {:?}",
+        result.issues
+    );
+}
+
+#[test]
+fn any_and_all_subqueries_in_a_select_list_test_rows_like_in() {
+    // Only the value compared is read, as with IN (subquery).
+    for op in ["ANY", "ALL"] {
+        let sql = format!(
+            "SELECT b.book_id = {op} (SELECT r.book_id FROM LAB.RAW.REVIEWS AS r) AS listed \
+             FROM LAB.SHELF.BOOKS AS b"
+        );
+        let result = run_analysis(&sql, Dialect::Postgres, Some(shelf_schema()));
+        let stmt = first_statement(&result);
+        assert_eq!(
+            base_sources_of(&stmt, "listed"),
+            expected_sources(&["books.book_id"]),
+            "{sql}"
+        );
+    }
+}

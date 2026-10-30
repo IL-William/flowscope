@@ -754,6 +754,30 @@ impl StatementContext {
         }
     }
 
+    /// Register a scalar subquery of a select list under its unique key, so a
+    /// column qualified with the key resolves to the subquery's own column node.
+    ///
+    /// Unlike a derived table it is not a relation of the scope: it has no
+    /// `alias_instances` or `tables` entry, so it neither joins the relations an
+    /// unqualified column may belong to nor becomes a base relation the
+    /// source-less projections draw an edge from.
+    pub(crate) fn register_scalar_subquery_in_scope(
+        &mut self,
+        key: String,
+        node_id: Arc<str>,
+        columns: Vec<OutputColumn>,
+    ) {
+        // Also a subquery alias, so the implied schema leaves it out the way it
+        // does a derived table, however a reference to it travels (a lateral
+        // alias carries it into a later item's sources).
+        self.subquery_aliases.insert(key.clone());
+        self.table_node_ids.insert(key.clone(), node_id);
+        if let Some(scope) = self.current_scope_mut() {
+            scope.aliases.insert(key.clone(), key.clone());
+        }
+        self.register_subquery_columns_in_scope(key, columns);
+    }
+
     /// Returns true when the current scope already materialized columns for `name`.
     pub(crate) fn has_subquery_columns_in_current_scope(&self, name: &str) -> bool {
         self.current_scope()
