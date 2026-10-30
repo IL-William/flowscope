@@ -792,10 +792,23 @@ impl<'a> Analyzer<'a> {
     ) -> Option<String> {
         match qualifier {
             Some(q) => {
+                // Bare names are stored normalized, so `reviews` finds
+                // `LAB.RAW.REVIEWS` where the dialect folds to upper case.
+                let key = self.normalize_identifier(q);
                 // Check scopes in reverse order (innermost first) for correct shadowing
                 for scope in ctx.scope_stack.iter().rev() {
                     if let Some(canonical) = scope.aliases.get(q) {
                         return Some(canonical.clone());
+                    }
+                    // A table read without an alias is named by its bare name,
+                    // which shadows an enclosing scope's alias of that name.
+                    if let Some(known) = scope.bare_tables.get(&key) {
+                        // `None`: two relations of the scope share the name.
+                        return known.clone();
+                    }
+                    // A name the scope defines with no table behind it.
+                    if scope.subquery_aliases.contains(&key) {
+                        return None;
                     }
                 }
 
@@ -828,7 +841,8 @@ impl<'a> Analyzer<'a> {
         qualifier: &str,
     ) -> Option<Arc<str>> {
         // Try instance-aware lookup first
-        if let Some(instance) = ctx.resolve_alias_instance(qualifier) {
+        let key = self.normalize_identifier(qualifier);
+        if let Some(instance) = ctx.resolve_alias_instance(qualifier, &key) {
             return Some(instance.node_id.clone());
         }
         // Fallback: resolve alias to canonical, then look up in table_node_ids
