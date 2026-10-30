@@ -11,7 +11,7 @@
 //! The analyzer works with the parent `Analyzer` to build column-level lineage graphs
 //! by identifying data flow from source columns through expressions to output columns.
 
-use super::context::{ColumnRef, StatementContext};
+use super::context::{ColumnRef, OutputColumn, StatementContext};
 use super::functions;
 use super::helpers::{check_expr_types, generate_statement_scoped_node_id};
 use super::Analyzer;
@@ -148,6 +148,35 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
     /// select targets, the statement's output at the top, as if the query
     /// returned them, and would join the column list of an enclosing CTE.
     fn analyze_predicate_subquery(&mut self, query: &ast::Query) {
+        self.analyze_subquery_node(query);
+    }
+
+    /// Analyzes a subquery a select list reads as a value, `(select max(x) ...)`,
+    /// and returns one reference per column it projects, qualified with the key
+    /// of its node. The output column that reads the value then draws its edge
+    /// from the subquery's column, which carries what the subquery reads, and
+    /// not from the relations of the enclosing select: the subquery's text
+    /// names its own tables' columns, which the enclosing select does not own.
+    pub(crate) fn analyze_scalar_subquery(&mut self, query: &ast::Query) -> Vec<ColumnRef> {
+        let (key, node_id, columns) = self.analyze_subquery_node(query);
+        let refs = columns
+            .iter()
+            .map(|column| ColumnRef {
+                table: Some(key.clone()),
+                column: column.name.clone(),
+            })
+            .collect();
+        self.ctx
+            .register_scalar_subquery_in_scope(key, node_id, columns);
+        refs
+    }
+
+    /// Analyzes `query` against a `(subquery)` node of its own, keyed uniquely
+    /// within the statement, and takes its output columns back.
+    fn analyze_subquery_node(
+        &mut self,
+        query: &ast::Query,
+    ) -> (String, Arc<str>, Vec<OutputColumn>) {
         let checkpoint = self.ctx.projection_checkpoint();
         self.ctx.predicate_subqueries += 1;
         let key = format!("{PREDICATE_SUBQUERY}#{}", self.ctx.predicate_subqueries);
@@ -158,8 +187,288 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             qualified_name: Some(PREDICATE_SUBQUERY.into()),
             ..Default::default()
         });
+        // The subquery's own select clears the grouping the enclosing select
+        // set up, and the items after it still need it to tell a key from an
+        // aggregate.
+        let grouping_columns = self.ctx.grouping_columns.clone();
+        let has_group_by = self.ctx.has_group_by;
         self.analyzer.analyze_query(self.ctx, query, Some(&node_id));
-        self.ctx.take_output_columns_since(checkpoint);
+        self.ctx.grouping_columns = grouping_columns;
+        self.ctx.has_group_by = has_group_by;
+        let columns = self.ctx.take_output_columns_since(checkpoint);
+        (key, node_id, columns)
+    }
+
+    /// Analyzes each subquery a select item reads as a value and returns the
+    /// references to the columns they project. `EXISTS` and `IN (subquery)` test
+    /// rows rather than carry a column, and a subquery inside another query is
+    /// that query's own to analyze, so neither is visited.
+    pub(crate) fn analyze_scalar_subqueries(&mut self, expr: &Expr) -> Vec<ColumnRef> {
+        let mut queries = Vec::new();
+        if Self::collect_scalar_subqueries(expr, &mut queries, 0) {
+            self.analyzer
+                .emit_depth_limit_warning(self.ctx.statement_index);
+        }
+        queries
+            .into_iter()
+            .flat_map(|query| self.analyze_scalar_subquery(query))
+            .collect()
+    }
+
+    /// Collects the subqueries `expr` reads in a value position, left to right,
+    /// and reports whether the depth limit cut the walk short.
+    ///
+    /// It must stay in step with `collect_column_refs`: a form that one reads
+    /// operands of and the other does not leaves a subquery read by the text
+    /// only, which the enclosing relation then gets credited with. Forms that
+    /// test rows (`EXISTS`, `IN (subquery)`) or open a scope of their own
+    /// (a lambda) are not walked into.
+    fn collect_scalar_subqueries<'e>(
+        expr: &'e Expr,
+        queries: &mut Vec<&'e ast::Query>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_RECURSION_DEPTH {
+            return true;
+        }
+        let next_depth = depth + 1;
+        let mut depth_limited = false;
+        let mut walk = |e: &'e Expr, queries: &mut Vec<&'e ast::Query>| {
+            depth_limited |= Self::collect_scalar_subqueries(e, queries, next_depth);
+        };
+
+        match expr {
+            Expr::Subquery(query) => queries.push(query),
+            Expr::BinaryOp { .. } => {
+                for operand in binary_op_operands(expr) {
+                    walk(operand, queries);
+                }
+            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::Nested(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::Extract { expr, .. }
+            | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr)
+            | Expr::IsTrue(expr)
+            | Expr::IsNotTrue(expr)
+            | Expr::IsFalse(expr)
+            | Expr::IsNotFalse(expr)
+            | Expr::IsUnknown(expr)
+            | Expr::IsNotUnknown(expr)
+            | Expr::IsNormalized { expr, .. }
+            | Expr::Ceil { expr, .. }
+            | Expr::Floor { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::Prefixed { value: expr, .. }
+            | Expr::Named { expr, .. }
+            | Expr::OuterJoin(expr)
+            | Expr::Prior(expr)
+            | Expr::InSubquery { expr, .. } => walk(expr, queries),
+            Expr::Interval(interval) => walk(&interval.value, queries),
+            Expr::Function(func) => {
+                if let ast::FunctionArguments::List(args) = &func.args {
+                    for arg in &args.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                            | FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            }
+                            | FunctionArg::ExprNamed {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            } => walk(e, queries),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    walk(op, queries);
+                }
+                for case_when in conditions {
+                    walk(&case_when.condition, queries);
+                    walk(&case_when.result, queries);
+                }
+                if let Some(el) = else_result {
+                    walk(el, queries);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                walk(expr, queries);
+                for item in list {
+                    walk(item, queries);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                walk(expr, queries);
+                walk(low, queries);
+                walk(high, queries);
+            }
+            Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+                walk(expr, queries);
+                walk(pattern, queries);
+            }
+            Expr::IsDistinctFrom(left, right)
+            | Expr::IsNotDistinctFrom(left, right)
+            | Expr::SimilarTo {
+                expr: left,
+                pattern: right,
+                ..
+            }
+            | Expr::RLike {
+                expr: left,
+                pattern: right,
+                ..
+            }
+            | Expr::Position {
+                expr: left,
+                r#in: right,
+            }
+            | Expr::AtTimeZone {
+                timestamp: left,
+                time_zone: right,
+            }
+            | Expr::InUnnest {
+                expr: left,
+                array_expr: right,
+                ..
+            } => {
+                walk(left, queries);
+                walk(right, queries);
+            }
+            // `= ANY (subquery)` tests rows as `IN (subquery)` does; only the
+            // value compared is read.
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                walk(left, queries);
+                if !matches!(**right, Expr::Subquery(_)) {
+                    walk(right, queries);
+                }
+            }
+            Expr::MemberOf(member_of) => {
+                walk(&member_of.value, queries);
+                walk(&member_of.array, queries);
+            }
+            Expr::Tuple(exprs)
+            | Expr::Struct { values: exprs, .. }
+            | Expr::Array(ast::Array { elem: exprs, .. }) => {
+                for e in exprs {
+                    walk(e, queries);
+                }
+            }
+            Expr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                walk(expr, queries);
+                if let Some(what) = trim_what {
+                    walk(what, queries);
+                }
+                for characters in trim_characters.iter().flatten() {
+                    walk(characters, queries);
+                }
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                walk(expr, queries);
+                for bound in [substring_from, substring_for].into_iter().flatten() {
+                    walk(bound, queries);
+                }
+            }
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                walk(expr, queries);
+                walk(overlay_what, queries);
+                walk(overlay_from, queries);
+                if let Some(length) = overlay_for {
+                    walk(length, queries);
+                }
+            }
+            Expr::Convert { expr, styles, .. } => {
+                walk(expr, queries);
+                for style in styles {
+                    walk(style, queries);
+                }
+            }
+            Expr::JsonAccess { value, path } => {
+                walk(value, queries);
+                for elem in &path.path {
+                    if let ast::JsonPathElem::Bracket { key } = elem {
+                        walk(key, queries);
+                    }
+                }
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                walk(root, queries);
+                for access in access_chain {
+                    match access {
+                        ast::AccessExpr::Dot(_) => {}
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            walk(index, queries);
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => {
+                            for bound in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                                walk(bound, queries);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Dictionary(fields) => {
+                for field in fields {
+                    walk(&field.value, queries);
+                }
+            }
+            Expr::Map(map) => {
+                for entry in &map.entries {
+                    walk(&entry.key, queries);
+                    walk(&entry.value, queries);
+                }
+            }
+            Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => {
+                for e in sets.iter().flatten() {
+                    walk(e, queries);
+                }
+            }
+            // Listed rather than caught by `_`, as in `collect_column_refs`, so
+            // a variant added to sqlparser is a compile error here too. None of
+            // these reads a value a subquery could stand in for: names, literals,
+            // row-testing forms, and a lambda, whose body has its own parameters.
+            Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::Exists { .. }
+            | Expr::Lambda(_)
+            | Expr::MatchAgainst { .. }
+            | Expr::Value(_)
+            | Expr::TypedString(_)
+            | Expr::Wildcard(_)
+            | Expr::QualifiedWildcard(..) => {}
+        }
+
+        depth_limited
     }
 
     /// Recursively visits an expression to find and analyze subqueries.

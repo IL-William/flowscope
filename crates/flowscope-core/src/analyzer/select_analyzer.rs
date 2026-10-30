@@ -118,13 +118,14 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     // Check for lateral column alias usage
                     self.check_lateral_column_alias(expr, &defined_aliases);
 
-                    let (mut sources, name, aggregation) = {
+                    let (mut sources, name, aggregation, scalar_refs) = {
                         let mut ea = ExpressionAnalyzer::new(self.analyzer, self.ctx);
                         let column_refs = ea.extract_column_refs_with_warning(expr);
                         (
                             column_refs,
                             ea.derive_column_name(expr, idx),
                             ea.detect_aggregation(expr),
+                            ea.analyze_scalar_subqueries(expr),
                         )
                     };
 
@@ -136,6 +137,12 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                             &lateral_alias_sources,
                         );
                     }
+
+                    // What a scalar subquery reads reaches the item through the
+                    // subquery's own columns. They are not columns of a relation
+                    // of this select, so they are left out of the implied schema.
+                    let outer_sources = sources.len();
+                    sources.extend(scalar_refs);
 
                     let is_simple_ref = is_simple_column_ref(expr);
                     let expr_text = if is_simple_ref {
@@ -154,7 +161,7 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     // functions, arithmetic), we only record the column existence without
                     // a type since the expression output type differs from source column type.
                     let source_type = if is_simple_ref { &data_type } else { &None };
-                    self.record_source_columns_with_type(&sources, source_type);
+                    self.record_source_columns_with_type(&sources[..outer_sources], source_type);
 
                     self.analyzer.add_output_column_with_aggregation(
                         self.ctx,
@@ -173,10 +180,14 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     // Check for lateral column alias usage
                     self.check_lateral_column_alias(expr, &defined_aliases);
 
-                    let (mut sources, aggregation) = {
+                    let (mut sources, aggregation, scalar_refs) = {
                         let mut ea = ExpressionAnalyzer::new(self.analyzer, self.ctx);
                         let column_refs = ea.extract_column_refs_with_warning(expr);
-                        (column_refs, ea.detect_aggregation(expr))
+                        (
+                            column_refs,
+                            ea.detect_aggregation(expr),
+                            ea.analyze_scalar_subqueries(expr),
+                        )
                     };
 
                     // Resolve lateral alias references if dialect supports them
@@ -187,6 +198,12 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                             &lateral_alias_sources,
                         );
                     }
+
+                    // What a scalar subquery reads reaches the item through the
+                    // subquery's own columns. They are not columns of a relation
+                    // of this select, so they are left out of the implied schema.
+                    let outer_sources = sources.len();
+                    sources.extend(scalar_refs);
 
                     let name = alias.value.clone();
                     let is_simple_ref = is_simple_column_ref(expr);
@@ -206,7 +223,7 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     // functions, arithmetic), we only record the column existence without
                     // a type since the expression output type differs from source column type.
                     let source_type = if is_simple_ref { &data_type } else { &None };
-                    self.record_source_columns_with_type(&sources, source_type);
+                    self.record_source_columns_with_type(&sources[..outer_sources], source_type);
 
                     // Record this alias for subsequent lateral column alias checking
                     let normalized_alias = self.analyzer.normalize_identifier(&name);
